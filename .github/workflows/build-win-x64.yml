@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Build Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'fix/**']
+    paths:
+      - 'Kiro-account-manager/**'
+      - '.github/workflows/build-win-x64.yml'
+
+env:
+  WORKING_DIR: Kiro-account-manager
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install setuptools (for node-gyp)
+        run: pip install setuptools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci
+
+      - name: Build
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run build
+
+      # NSIS 安装包 + 免安装目录（win-unpacked）
+      - name: Package Windows x64
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npx electron-builder --win nsis dir --x64 -p never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-setup
+          path: ${{ env.WORKING_DIR }}/dist/*.exe
+          if-no-files-found: error
+
+      - name: Upload portable (unpacked)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-portable
+          path: ${{ env.WORKING_DIR }}/dist/win-unpacked/
+          if-no-files-found: error
