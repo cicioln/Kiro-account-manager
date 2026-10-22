@@ -1181,13 +1181,14 @@ export class ProxyServer {
       }
     }
 
-    const task = this.doRefreshToken(account, signal)
+    // 共享刷新任务不绑定任何单个请求的 signal：否则首个发起者断开会中止刷新，
+    // 其他等待者全部判为失败并无谓切号。每个调用方各自用 abortable 包裹等待
+    const task = this.doRefreshToken(account)
     this.refreshingTokens.set(account.id, task)
-    try {
-      return await task
-    } finally {
-      this.refreshingTokens.delete(account.id)
-    }
+    task.finally(() => {
+      if (this.refreshingTokens.get(account.id) === task) this.refreshingTokens.delete(account.id)
+    }).catch(() => undefined)
+    return await this.abortable(task, signal)
   }
 
   /** 实际执行 Token 刷新（由 refreshToken 包裹在途去重后调用） */
@@ -1878,6 +1879,20 @@ export class ProxyServer {
         return
       }
 
+      // 浏览器跨站防护：CORS 为 *，且未配置 API Key 时鉴权直接放行 → 用户访问的任意网页都能
+      // 用 text/plain 简单请求（无预检）调用本地反代、读 /admin/accounts、改 /admin/config。
+      // 带 Origin 头的浏览器请求：/admin/* 一律拒绝；其余接口在未配置 API Key 时拒绝。
+      // Claude Code / SDK 等原生客户端不发 Origin，不受影响。
+      const origin = req.headers['origin']
+      if (origin && path !== '/health' && path !== '/') {
+        const hasAnyKey = (this.config.apiKeys && this.config.apiKeys.length > 0) || !!this.config.apiKey
+        if (path.startsWith('/admin/') || !hasAnyKey) {
+          proxyLogger.warn('ProxyServer', `Blocked browser cross-origin request from ${origin} to ${path}`)
+          this.sendError(res, 403, 'Cross-origin browser requests are not allowed', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          return
+        }
+      }
+
       // API Key 验证（健康检查端点除外）
       if (path !== '/health' && path !== '/') {
         const authResult = this.validateApiKey(req)
@@ -1951,6 +1966,12 @@ export class ProxyServer {
     } catch (error) {
       if (this.isAbortError(error, controller.signal)) {
         proxyLogger.info('ProxyServer', `Request aborted: ${method} ${path}`)
+        return
+      }
+      // 请求体 JSON 解析失败 → 400（旧实现返回 500，SDK 会当作可重试错误反复重发）
+      if (error instanceof SyntaxError && !res.headersSent) {
+        this.sendError(res, 400, `Invalid JSON body: ${error.message}`,
+          this.isAnthropicPath(path) ? 'anthropic' : 'openai')
         return
       }
       // P0-1 body 超限 → 413
@@ -2126,6 +2147,42 @@ export class ProxyServer {
     }))
   }
 
+  /**
+   * 流式请求出错时的账号侧处理（流式路径直接调 callKiroApiStream，不经过 callWithRetry）：
+   * - 识别封禁（TEMPORARILY_SUSPENDED / AccountSuspendedException）→ markSuspended + 通知
+   * - 401/403 → 后台刷新 token（下一次请求即可用新 token，而非等到 expiresAt）
+   * - 其余按状态码记入断路器
+   */
+  private handleStreamAccountError(account: ProxyAccount, error: Error): void {
+    const errMsg = error.message || ''
+    const suspendInfo = this.detectSuspendedError(errMsg)
+    if (suspendInfo) {
+      const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfo.reason, suspendInfo.message)
+      if (newlyMarked) {
+        this.events.onAccountSuspended?.({
+          accountId: account.id,
+          email: account.email,
+          reason: suspendInfo.reason,
+          message: suspendInfo.message
+        })
+        this.appendAuditLog('account_suspended', { accountId: account.id, email: account.email, reason: suspendInfo.reason })
+      }
+      return
+    }
+    const statusCode = parseInt(errMsg.match(/\b([45]\d{2})\b/)?.[1] || '', 10) || undefined
+    const isQuota = /quota exhausted|ServiceQuotaExceeded|reached the limit|\b402\b/i.test(errMsg)
+    const isThrottle = /throttl|rate limit|\b429\b/i.test(errMsg)
+    const effectiveStatus = isQuota ? 402 : isThrottle ? 429 : statusCode
+    this.accountPool.recordError(
+      account.id,
+      effectiveStatus ? classifyError(effectiveStatus) : ErrorType.RECOVERABLE,
+      effectiveStatus
+    )
+    if (statusCode === 401 || statusCode === 403) {
+      void this.refreshToken(account).catch(() => undefined)
+    }
+  }
+
   // 设置 CORS 头
   private setCorsHeaders(res: http.ServerResponse): void {
     res.setHeader('Access-Control-Allow-Origin', '*')
@@ -2291,7 +2348,8 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    // 传 apiKeyId：否则 Gemini 路由绕过 API Key 的账号绑定（apiKeyAccountBindings）
+    const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
       this.sendError(res, 503, 'No available accounts')
@@ -2331,6 +2389,9 @@ export class ProxyServer {
               this.stats.outputTokens += usage.outputTokens
               this.stats.totalCredits += usage.credits || 0
               this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+              if (matchedApiKey) {
+                this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, modelId, path)
+              }
               resolve()
             },
             (error) => {
@@ -2341,6 +2402,7 @@ export class ProxyServer {
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
               res.end()
               this.recordRequestFailed()
+              this.handleStreamAccountError(account as ProxyAccount, error)
               resolve()
             },
             signal,
@@ -2931,11 +2993,11 @@ export class ProxyServer {
           }
           console.error('[ProxyServer] Stream error:', error)
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+          res.write('data: [DONE]\n\n')
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          this.handleStreamAccountError(account, error)
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3082,7 +3144,13 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
+        this.stats.totalCredits += result.usage.credits || 0
+        this.events.onCreditsUpdate?.(this.stats.totalCredits)
         this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        // 非流式也要累计 API Key 用量，否则 stream:false 的客户端永远不受 creditsLimit 约束
+        if (matchedApiKey) {
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/messages')
+        }
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
@@ -3346,6 +3414,14 @@ export class ProxyServer {
             return
           }
           console.error('[ProxyServer] Stream error:', error)
+          // 先关闭未结束的 content block，否则客户端会留下半截块
+          if (hasStartedTextBlock || hasStartedThinkingBlock) {
+            if (hasStartedThinkingBlock) flushThinkingSignature()
+            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
+            hasStartedTextBlock = false
+            hasStartedThinkingBlock = false
+          }
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
           })
@@ -3353,8 +3429,7 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          this.handleStreamAccountError(account, error)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()

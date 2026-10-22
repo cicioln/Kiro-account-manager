@@ -1238,7 +1238,7 @@ export async function callKiroApiStream(
   payload: KiroPayload,
   // onChunk 可返回 Promise：下游 SSE 写缓冲打满时返回 drain promise，流解析 await 实现背压
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void | Promise<void>,
-  onComplete: (usage: KiroUsage) => void,
+  onComplete: (usage: KiroUsage) => void | Promise<void>,
   onError: (error: Error) => void,
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
@@ -1306,7 +1306,8 @@ export async function callKiroApiStream(
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
-        lastError = new Error(`Quota exhausted on ${endpoint.name}`)
+        // 消息里带上状态码：调用方按 /\d{3}/ 解析，旧消息无数字导致限流/耗尽不进入冷却
+        lastError = new Error(`Quota exhausted (429) on ${endpoint.name}`)
         continue
       }
 
@@ -1439,7 +1440,7 @@ function extractStringHeaders(headers: Uint8Array): Record<string, string> {
 export const __test_parseEventStream = (
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse) => void | Promise<void>,
-  onComplete: (usage: KiroUsage) => void,
+  onComplete: (usage: KiroUsage) => void | Promise<void>,
   onError: (error: Error) => void
 ): Promise<void> => parseEventStream(body, onChunk, onComplete, onError)
 
@@ -1471,7 +1472,7 @@ export function estimateTokens(text: string): number {
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void | Promise<void>,
-  onComplete: (usage: KiroUsage) => void,
+  onComplete: (usage: KiroUsage) => void | Promise<void>,
   onError: (error: Error) => void,
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
@@ -2183,7 +2184,9 @@ async function parseEventStream(
     
     throwIfAborted(signal)
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
-    onComplete(usage)
+    // await 并让异常走 onError：调用方的 onComplete 是 async，旧实现不 await，内部抛错会变成
+    // unhandled rejection，handler 的 resolve() 永远不执行，请求挂死、AbortController 泄漏
+    await onComplete(usage)
   } catch (error) {
     onError(signal?.aborted ? getAbortError(signal) : error as Error)
   } finally {
