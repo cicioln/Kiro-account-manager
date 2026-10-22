@@ -1394,8 +1394,9 @@ export async function callKiroApiStream(
   }
 }
 
-// 从 headers 中提取 event type
-function extractEventType(headers: Uint8Array): string {
+// 解析 headers 中所有 string 类型的值（:event-type / :message-type / :exception-type 等）
+function extractStringHeaders(headers: Uint8Array): Record<string, string> {
+  const result: Record<string, string> = {}
   let offset = 0
   while (offset < headers.length) {
     if (offset >= headers.length) break
@@ -1415,9 +1416,7 @@ function extractEventType(headers: Uint8Array): string {
       if (offset + valueLen > headers.length) break
       const value = new TextDecoder().decode(headers.slice(offset, offset + valueLen))
       offset += valueLen
-      if (name === ':event-type') {
-        return value
-      }
+      result[name] = value
       continue
     }
     
@@ -1433,7 +1432,26 @@ function extractEventType(headers: Uint8Array): string {
       break
     }
   }
-  return ''
+  return result
+}
+
+// 仅供测试：导出事件流解析器
+export const __test_parseEventStream = (
+  body: ReadableStream<Uint8Array>,
+  onChunk: (text: string, toolUse?: KiroToolUse) => void | Promise<void>,
+  onComplete: (usage: KiroUsage) => void,
+  onError: (error: Error) => void
+): Promise<void> => parseEventStream(body, onChunk, onComplete, onError)
+
+// 解析累积的工具输入：空 buffer 视为无参调用 {}；JSON 不完整（流被截断）返回 null
+function tryParseToolInput(buffer: string): Record<string, unknown> | null {
+  if (!buffer || !buffer.trim()) return {}
+  try {
+    const parsed = JSON.parse(buffer)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
 }
 
 // Tool Use 状态跟踪
@@ -1657,18 +1675,24 @@ async function parseEventStream(
         // - 4 bytes: message CRC
 
         const totalLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(0, false)
-        
+        const headersLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(4, false)
+
+        // 帧长度校验：totalLength < 16 时 slice 不前进会死循环卡住主进程；超大值会让缓冲无限增长
+        if (totalLength < 16 || totalLength > 16 * 1024 * 1024 || 12 + headersLength > totalLength - 4) {
+          throw new Error(`Corrupt event stream frame (totalLength=${totalLength}, headersLength=${headersLength})`)
+        }
+
         if (buffer.length < totalLength) {
           break // 等待更多数据
         }
 
-        const headersLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(4, false)
-        
-        // 从 headers 中提取 event type
+        // 从 headers 中提取 event type / message type
         const headersStart = 12
         const headersEnd = 12 + headersLength
-        const eventType = extractEventType(buffer.slice(headersStart, headersEnd))
-        
+        const frameHeaders = extractStringHeaders(buffer.slice(headersStart, headersEnd))
+        const eventType = frameHeaders[':event-type'] || ''
+        const messageType = frameHeaders[':message-type']
+
         // 提取 payload
         const payloadStart = 12 + headersLength
         const payloadEnd = totalLength - 4 // 减去 message CRC
@@ -1679,7 +1703,15 @@ async function parseEventStream(
           try {
             const payloadText = new TextDecoder().decode(payloadBytes)
             const event = JSON.parse(payloadText)
-            
+
+            // AWS 异常帧：:message-type=exception/error，没有 :event-type。
+            // 旧实现漏判导致流中途报错被吞，客户端收到空的/截断的「成功」响应
+            if (messageType === 'exception' || messageType === 'error') {
+              const exType = frameHeaders[':exception-type'] || frameHeaders[':error-code'] || event.__type || 'StreamError'
+              const exMsg = event.message || event.Message || frameHeaders[':error-message'] || payloadText.slice(0, 300)
+              throw new Error(`${exType}: ${exMsg}`)
+            }
+
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const assistantResp = event.assistantResponseEvent || event
@@ -1742,19 +1774,19 @@ async function parseEventStream(
                 if (currentToolUse && currentToolUse.toolUseId !== toolUseId) {
                   // 前一个 tool use 被中断，完成它
                   if (!processedIds.has(currentToolUse.toolUseId)) {
-                    let finalInput: Record<string, unknown> = {}
-                    try {
-                      if (currentToolUse.inputBuffer) {
-                        finalInput = JSON.parse(currentToolUse.inputBuffer)
+                    // 输入 JSON 不完整时不发出 tool_use：旧实现会以 {} 发出，客户端用空参数执行工具
+                    const finalInput = tryParseToolInput(currentToolUse.inputBuffer)
+                    if (finalInput) {
+                      await onChunk('', {
+                        toolUseId: currentToolUse.toolUseId,
+                        name: currentToolUse.name,
+                        input: finalInput
+                      })
+                      if (toolLeakFixEnabled) {
+                        try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
                       }
-                    } catch { /* 忽略解析错误 */ }
-                    await onChunk('', {
-                      toolUseId: currentToolUse.toolUseId,
-                      name: currentToolUse.name,
-                      input: finalInput
-                    })
-                    if (toolLeakFixEnabled) {
-                      try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+                    } else {
+                      await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
                     }
                     totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
                     processedIds.add(currentToolUse.toolUseId)
@@ -1806,21 +1838,21 @@ async function parseEventStream(
                   }
                 }
                 
-                // 只有在成功解析或有错误信息时才发送
-                await onChunk('', {
-                  toolUseId: currentToolUse.toolUseId,
-                  name: currentToolUse.name,
-                  input: finalInput
-                })
-                if (toolLeakFixEnabled && !parseError) {
-                  try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+                // 解析失败时不发出 tool_use：旧实现把 {_error, _partialInput} 当作真实参数下发，
+                // 客户端会带着错误参数执行工具。改为仅以文本告知
+                if (!parseError) {
+                  await onChunk('', {
+                    toolUseId: currentToolUse.toolUseId,
+                    name: currentToolUse.name,
+                    input: finalInput
+                  })
+                  if (toolLeakFixEnabled) {
+                    try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+                  }
+                } else {
+                  await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API (output token limit) and was not executed.`)
                 }
                 totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
-
-                // 如果解析失败，额外发送一条文本消息告知用户
-                if (parseError) {
-                  await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API. The output may be incomplete due to token limits.`)
-                }
                 
                 processedIds.add(currentToolUse.toolUseId)
                 currentToolUse = null
@@ -2065,7 +2097,7 @@ async function parseEventStream(
             }
             
             // 检查错误
-            if (event._type || event.error) {
+            if (event.__type || event._type || event.error) {
               const errMsg = event.message || event.error?.message || 'Unknown stream error'
               throw new Error(errMsg)
             }
@@ -2089,21 +2121,20 @@ async function parseEventStream(
       try { await filterToolLeak(true) } catch { /* ignore */ }
     }
 
-    // 完成任何未完成的 tool use
+    // 完成任何未完成的 tool use（输入无法解析时不发出空参数调用，见 tryParseToolInput）
     if (currentToolUse && !processedIds.has(currentToolUse.toolUseId)) {
-      let finalInput: Record<string, unknown> = {}
-      try {
-        if (currentToolUse.inputBuffer) {
-          finalInput = JSON.parse(currentToolUse.inputBuffer)
+      const finalInput = tryParseToolInput(currentToolUse.inputBuffer)
+      if (finalInput) {
+        await onChunk('', {
+          toolUseId: currentToolUse.toolUseId,
+          name: currentToolUse.name,
+          input: finalInput
+        })
+        if (toolLeakFixEnabled) {
+          try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
         }
-      } catch { /* 忽略解析错误 */ }
-      await onChunk('', {
-        toolUseId: currentToolUse.toolUseId,
-        name: currentToolUse.name,
-        input: finalInput
-      })
-      if (toolLeakFixEnabled) {
-        try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+      } else {
+        await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
       }
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
     }

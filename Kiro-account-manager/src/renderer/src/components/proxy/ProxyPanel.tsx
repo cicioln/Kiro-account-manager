@@ -306,8 +306,10 @@ export function ProxyPanel() {
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
           groupId: acc.groupId,
           // 透传使用量：池内 isQuotaExhausted 据此判断，运行中用满后也会被跳过
-          quotaUsed: acc.usage?.current,
-          quotaLimit: acc.usage?.limit
+          // 已过重置日的「满」账号（用量数据未刷新）不传 quotaUsed，否则池内 isQuotaExhausted 永远为真
+          ...(isUsageFull(acc) || (acc.usage?.limit ?? 0) <= 0 || (acc.usage?.current ?? 0) < (acc.usage?.limit ?? 0)
+            ? { quotaUsed: acc.usage?.current, quotaLimit: acc.usage?.limit }
+            : {})
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
@@ -462,9 +464,16 @@ export function ProxyPanel() {
    * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
    */
   const accountsSyncSignature = useMemo(() => {
+    // 含「是否用满」标记：用量刷新后满→未满（月度重置）或未满→满时触发重同步，账号才能进出账号池
+    const now = Date.now()
     return Array.from(accounts.values())
       .filter(a => a.status === 'active' && a.credentials?.accessToken)
-      .map(a => `${a.id}:${a.groupId || ''}`)
+      .map(a => {
+        const limit = a.usage?.limit ?? 0
+        const resetAt = a.usage?.nextResetDate ? Date.parse(a.usage.nextResetDate) : NaN
+        const full = limit > 0 && (a.usage?.current ?? 0) >= limit && !(Number.isFinite(resetAt) && resetAt <= now)
+        return `${a.id}:${a.groupId || ''}:${full ? 'F' : ''}`
+      })
       .sort()
       .join('|')
   }, [accounts])

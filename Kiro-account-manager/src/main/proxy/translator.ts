@@ -163,21 +163,29 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
         if (item.arguments === undefined) {
           throw new Error('function_call requires arguments')
         }
-        messages.push({
-          role: 'assistant',
-          content: '',
-          tool_calls: [{
-            id: item.call_id,
-            type: 'function',
-            function: {
-              name: item.name,
-              arguments: item.arguments
-            }
-          }]
-        })
+        const toolCall = {
+          id: item.call_id,
+          type: 'function' as const,
+          function: {
+            name: item.name,
+            arguments: item.arguments
+          }
+        }
+        // 并行工具调用：连续的 function_call 合并到同一条 assistant 消息。
+        // 否则会变成多条 assistant 消息，后续工具结果归属错位，除第一个外的真实结果被丢弃
+        const prev = messages[messages.length - 1]
+        if (prev && prev.role === 'assistant') {
+          prev.tool_calls = [...(prev.tool_calls || []), toolCall]
+        } else {
+          messages.push({ role: 'assistant', content: '', tool_calls: [toolCall] })
+        }
+      } else if (itemType === 'reasoning' || itemType === 'item_reference') {
+        // Codex / Responses 客户端每轮会回传 reasoning（加密）与 item_reference，Kiro 无对应字段，跳过
+        continue
       } else {
         if (itemType !== undefined && itemType !== 'message') {
-          throw new Error(`Unsupported responses input item type: ${itemType}`)
+          console.warn(`[Translator] Skipping unsupported responses input item type: ${itemType}`)
+          continue
         }
         if (item.content === undefined) {
           throw new Error('message input item requires content')
@@ -320,7 +328,8 @@ export function openaiToKiro(
   const nonSystemMessages: OpenAIMessage[] = []
 
   for (const msg of request.messages) {
-    if (msg.role === 'system') {
+    // developer 角色（新版 OpenAI SDK / o 系列）等同于 system，旧实现会被静默丢弃
+    if (msg.role === 'system' || (msg.role as string) === 'developer') {
       systemCachePoint = mergeCachePoint(systemCachePoint, toKiroCachePoint(msg.cache_control))
       if (typeof msg.content === 'string') {
         systemPrompt += (systemPrompt ? '\n' : '') + msg.content
@@ -394,7 +403,12 @@ export function openaiToKiro(
       // 注意: 故意不读取 msg.reasoning_content (history 中不传给 Kiro)
       // Kiro 后端 schema 仅在响应输出中支持 assistantResponseMessage.reasoningContent，
       // 在请求 history 中传入此字段会触发 400 "Improperly formed request"
-      let assistantContent = typeof msg.content === 'string' ? msg.content : ''
+      // content 为数组（[{type:'text',text}]）时也要取出文本，否则历史回复全变成 "I understand."
+      let assistantContent = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.filter(p => p.type === 'text' && p.text).map(p => p.text).join('')
+          : ''
       if (!assistantContent.trim() && msg.tool_calls && msg.tool_calls.length > 0) {
         assistantContent = ' '
       } else if (!assistantContent.trim()) {
@@ -1133,7 +1147,8 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
         toolResults.push({
           toolUseId: block.tool_use_id,
           content: [{ text: resultContent }],
-          status: 'success'
+          // 透传 is_error：否则失败的命令会被当作成功结果交给模型
+          status: block.is_error ? 'error' : 'success'
         })
       }
     }
@@ -1177,9 +1192,9 @@ function extractClaudeAssistantContent(
     }
   }
 
-  // Kiro API 要求 content 非空
-  if (!content.trim() && toolUses.length > 0) {
-    content = ' '
+  // Kiro API 要求 content 非空（仅含 thinking 或 content:[] 的 assistant 轮也要兜底，否则 400 Improperly formed request）
+  if (!content.trim()) {
+    content = toolUses.length > 0 ? ' ' : 'I understand.'
   }
 
   if (thinking || redactedContent) {

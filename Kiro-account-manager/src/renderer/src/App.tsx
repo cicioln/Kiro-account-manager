@@ -300,17 +300,29 @@ function App(): React.JSX.Element {
     }
   }, [updateAccountStatus])
 
-  // 监听反代账号更新事件（Enterprise profileArn 自愈），持久化到 store + 磁盘
+  // 监听反代账号更新事件（反代自身刷新的 token + Enterprise profileArn 自愈），持久化到 store + 磁盘
+  // 反代刷新 token 后若不回写，store 仍是旧 refreshToken：重启/重同步后账号池会拿到已被轮换失效的 token
   useEffect(() => {
     const unsubscribe = window.api.onProxyAccountUpdate((info) => {
-      if (!info.profileArn) return
       const account = useAccountsStore.getState().accounts.get(info.id)
-      if (!account || account.credentials?.profileArn === info.profileArn) return
+      if (!account) return
+      const creds = account.credentials
+      const updates: Partial<typeof creds> = {}
+      // 只接受比 store 更新的 token，避免旧事件覆盖新 token
+      const isNewer = info.expiresAt != null && (creds?.expiresAt == null || info.expiresAt > creds.expiresAt)
+      if (info.accessToken && info.accessToken !== creds?.accessToken && isNewer) {
+        updates.accessToken = info.accessToken
+        updates.expiresAt = info.expiresAt
+        if (info.refreshToken) updates.refreshToken = info.refreshToken
+      }
+      const arnChanged = !!info.profileArn && creds?.profileArn !== info.profileArn
+      if (arnChanged) updates.profileArn = info.profileArn
+      if (Object.keys(updates).length === 0) return
       updateAccount(info.id, {
-        profileArn: info.profileArn,
-        credentials: { ...account.credentials, profileArn: info.profileArn }
+        ...(arnChanged ? { profileArn: info.profileArn } : {}),
+        credentials: { ...creds, ...updates }
       })
-      console.log(`[App] Persisted Enterprise profileArn for ${info.id}`)
+      console.log(`[App] Persisted proxy account update for ${info.id}${arnChanged ? ' (profileArn)' : ''}`)
     })
     return () => {
       unsubscribe()

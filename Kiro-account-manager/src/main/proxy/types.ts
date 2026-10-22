@@ -204,6 +204,7 @@ export interface ClaudeContentBlock {
   title?: string
   input?: unknown
   tool_use_id?: string
+  is_error?: boolean
   content?: string | ClaudeContentBlock[]
   cache_control?: ClaudeCacheControl
 }

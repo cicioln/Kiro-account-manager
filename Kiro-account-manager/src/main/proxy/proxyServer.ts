@@ -1202,10 +1202,13 @@ export class ProxyServer {
       const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
+        // 刷新成功即恢复可用并清零断路器（此前刷新失败累积的退避不应继续生效）
         this.accountPool.updateAccount(account.id, {
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
-          expiresAt: result.expiresAt
+          expiresAt: result.expiresAt,
+          isAvailable: true,
+          errorCount: 0
         })
         // 通知外部更新
         this.events.onAccountUpdate?.({
@@ -1338,9 +1341,20 @@ export class ProxyServer {
     if (this.isTokenExpiringSoon(account)) {
       const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
-        // 刷新失败，如果启用多账号才尝试获取下一个账号
+        // 刷新失败，如果启用多账号才尝试获取下一个账号：
+        // 排除刚失败的账号与 API Key/分组不允许的账号，且不返回同样需要刷新的账号
         if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
+          const exclude = new Set<string>([account.id])
+          for (const a of this.accountPool.getAllAccounts()) {
+            if (!isAllowed(a)) exclude.add(a.id)
+          }
+          const fallback = this.accountPool.getNextAccount(exclude)
+          if (!fallback) return null
+          if (this.isTokenExpiringSoon(fallback)) {
+            if (!(await this.refreshToken(fallback, signal))) return null
+            return this.accountPool.getAccount(fallback.id)
+          }
+          return fallback
         }
         return null
       }
@@ -1482,8 +1496,15 @@ export class ProxyServer {
 
         // 402/429: 额度耗尽，切换端点或账号
         if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
-          console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          // 真正的额度用尽（402 / ServiceQuotaExceeded / reached the limit）才标记耗尽；
+          // 普通限流（429 / Throttling / rate limit）只计入断路器退避
+          const isThrottle = /throttl|rate limit|\b429\b/i.test(errMsg)
+          const isQuotaExhaustion = errMsg.includes('402')
+            || errMsg.includes('ServiceQuotaExceededException')
+            || errMsg.includes('reached the limit')
+            || (/\bquota\b/i.test(errMsg) && !isThrottle)
+          console.log(`[ProxyServer] ${isQuotaExhaustion ? 'Quota exhausted' : 'Throttled'}, switching endpoint or account`)
+          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, isQuotaExhaustion ? 402 : 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
@@ -2814,7 +2835,8 @@ export class ProxyServer {
         kiroPayload,
         (text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
-          if (text && text.trim()) {
+          // 不能用 text.trim() 过滤：Kiro 会把 "\n\n"、缩进空格单独成帧，丢掉会破坏代码缩进与段落
+          if (text) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
               const chunk = createOpenaiStreamChunk(id, model, { reasoning_content: text })
@@ -3162,7 +3184,9 @@ export class ProxyServer {
             currentBlockIndex++
             return this.waitForDrain(res)
           }
-          if (text && text.trim()) {
+          // 不能用 text.trim() 过滤：Kiro 会把 "\n\n"、缩进空格单独成帧，丢掉会破坏代码缩进与段落。
+          // 仅在需要「新开」文本块时跳过纯空白（避免产生只含空白的空块）
+          if (text && (text.trim() || (isThinking ? hasStartedThinkingBlock : hasStartedTextBlock))) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 Anthropic thinking block
               if (hasStartedTextBlock) {

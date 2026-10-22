@@ -368,6 +368,18 @@ function initProxyServer(): ProxyServer {
       },
       // Token 刷新回调 - 复用已有的刷新逻辑，含账号绑定代理
       onTokenRefresh: async (account) => {
+        // 与 backgroundBatchRefresh 共享在途集合：同一 refreshToken 并发刷新会让其中一方拿到被 rotate 作废的 token
+        if (poolRefreshInFlightIds.has(account.id)) {
+          // 等主进程那次刷新完成（它会写回账号池），再从池里取最新 token
+          for (let i = 0; i < 60 && poolRefreshInFlightIds.has(account.id); i++) {
+            await new Promise(r => setTimeout(r, 500))
+          }
+          const latest = proxyServer?.getAccountPool().getAccount(account.id)
+          if (latest?.accessToken && latest.expiresAt && latest.expiresAt > Date.now() + 60_000) {
+            return { success: true, accessToken: latest.accessToken, refreshToken: latest.refreshToken, expiresAt: latest.expiresAt }
+          }
+        }
+        poolRefreshInFlightIds.add(account.id)
         try {
           console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}${account.proxyUrl ? ' [via bound proxy]' : ''}`)
           const refreshResult = await refreshTokenByMethod(
@@ -390,6 +402,8 @@ function initProxyServer(): ProxyServer {
           return { success: false, error: refreshResult.error || 'Token 刷新失败' }
         } catch (error) {
           return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+        } finally {
+          poolRefreshInFlightIds.delete(account.id)
         }
       },
       // 账号更新回调 - 通知渲染进程更新账号数据
@@ -398,7 +412,8 @@ function initProxyServer(): ProxyServer {
           id: account.id,
           accessToken: account.accessToken,
           refreshToken: account.refreshToken,
-          expiresAt: account.expiresAt
+          expiresAt: account.expiresAt,
+          profileArn: account.profileArn
         })
       },
       // 账号被 Kiro 后端长期封禁 - 通知渲染进程标记 lastError + 持久化到 store
@@ -2256,8 +2271,10 @@ function createWindow(): void {
                 authMethod,
                 provider,
                 proxyUrl: buildProxyUrl(acc.id),
-                quotaUsed: acc.usage?.current,
-                quotaLimit: acc.usage?.limit
+                // 已过重置日但用量未刷新的「满」账号不传 quotaUsed，避免池内被永久判为耗尽
+                ...((acc.usage?.limit ?? 0) > 0 && (acc.usage?.current ?? 0) >= acc.usage.limit
+                  ? {}
+                  : { quotaUsed: acc.usage?.current, quotaLimit: acc.usage?.limit })
               }
             })
           if (proxyAccounts.length > 0) {
@@ -3698,6 +3715,17 @@ app.whenReady().then(async () => {
               newAccessToken = refreshResult.accessToken || accessToken
               newRefreshToken = refreshResult.refreshToken || refreshToken
               newExpiresIn = refreshResult.expiresIn
+
+              // 立即写回反代账号池：否则池内仍是旧 refreshToken（可能已被 rotate 作废），
+              // 下次池内自刷新会用旧 token 失败并把账号标记不可用
+              if (account.id && newAccessToken && proxyServer?.getAccountPool().getAccount(account.id)) {
+                proxyServer.getAccountPool().updateAccount(account.id, {
+                  accessToken: newAccessToken,
+                  refreshToken: newRefreshToken,
+                  expiresAt: Date.now() + (newExpiresIn || 3600) * 1000,
+                  isAvailable: true
+                })
+              }
 
               // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
               // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。

@@ -148,15 +148,33 @@ export class AccountPool {
     const candidates = excludeIds
       ? accountList.filter(a => !excludeIds.has(a.id))
       : accountList
-    const allExhausted = candidates.length > 0 && candidates.every(a => this.isQuotaExhausted(a, now))
+    // 封禁账号不参与判断，否则只要有一个封禁号，「全部耗尽」分支就永远不会命中
+    const nonSuspended = candidates.filter(a => !this.isSuspended(a))
+    const allExhausted = nonSuspended.length > 0 && nonSuspended.every(a => this.isQuotaExhausted(a, now))
     if (allExhausted) {
       console.log(`[AccountPool] All ${candidates.length} accounts quota exhausted, no fallback available`)
       return null
     }
 
-    // 还有非配额原因不可用的账号，返回冷却时间最短的
-    const nonExhausted = candidates.filter(a => !this.isQuotaExhausted(a, now))
+    // 还有非配额原因不可用的账号，返回冷却最早结束的（排除封禁/无法刷新的账号）
+    const nonExhausted = candidates.filter(a => !this.isQuotaExhausted(a, now) && this.isFallbackEligible(a, now))
     return this.getAccountWithShortestCooldown(nonExhausted, now)
+  }
+
+  // 兜底候选：封禁账号、已过期且无 refreshToken 的账号不能作为兜底返回
+  private isFallbackEligible(account: ProxyAccount, now: number): boolean {
+    if (this.isSuspended(account)) return false
+    if (account.expiresAt && account.expiresAt < now && !account.refreshToken) return false
+    return true
+  }
+
+  // 断路器冷却结束时间：lastUsed + base * 2^(errorCount-1)（与 isAccountAvailable 一致）
+  private getCooldownEnd(account: ProxyAccount): number {
+    const explicit = account.cooldownUntil || 0
+    const failures = account.errorCount || 0
+    if (failures <= 0 || !account.lastUsed) return explicit
+    const multiplier = Math.min(Math.pow(2, failures - 1), this.config.maxBackoffMultiplier)
+    return Math.max(explicit, account.lastUsed + this.config.baseCooldownMs * multiplier)
   }
 
   // 获取特定账号
@@ -180,8 +198,8 @@ export class AccountPool {
       }
     }
 
-    // 没有立即可用的账号，返回冷却时间最短的（排除指定账号）
-    const otherAccounts = accountList.filter(a => !excludeSet.has(a.id))
+    // 没有立即可用的账号，返回冷却时间最短的（排除指定账号、封禁、配额耗尽、无法刷新的账号）
+    const otherAccounts = accountList.filter(a => !excludeSet.has(a.id) && !this.isQuotaExhausted(a, now) && this.isFallbackEligible(a, now))
     if (otherAccounts.length === 0) return null
     return this.getAccountWithShortestCooldown(otherAccounts, now)
   }
@@ -306,8 +324,8 @@ export class AccountPool {
     let shortestWait = Infinity
 
     for (const account of accounts) {
-      const cooldownUntil = account.cooldownUntil || 0
-      const wait = Math.max(0, cooldownUntil - now)
+      // 旧实现只看 cooldownUntil（从未被赋值），等于总返回第一个；改为按断路器退避结束时间排序
+      const wait = Math.max(0, this.getCooldownEnd(account) - now)
       
       if (wait < shortestWait) {
         shortestWait = wait
@@ -376,7 +394,8 @@ export class AccountPool {
     // 配额类错误额外标记耗尽，并按配置的 quotaResetMs 设定自动恢复时间。
     // 否则 quotaExhaustedAt 一直 > 0，isQuotaExhausted 永远为 true，
     // 该账号会被永久跳过（直到 updateQuota/reset 被显式调用）。
-    const isQuotaError = statusCode === 402 || statusCode === 429
+    // 仅 402（额度用尽）标记耗尽；429 限流只走断路器退避，避免短时限流把健康账号锁 1 小时
+    const isQuotaError = statusCode === 402
     if (isQuotaError) {
       quotaExhaustedAt = now
       // 仅在没有更明确的重置时间，或已有重置时间已过期时，按冷却窗口顺延
@@ -446,13 +465,15 @@ export class AccountPool {
     return { total: all.length, available, exhausted, cooldown }
   }
 
-  // 标记账号需要刷新 Token
+  // 标记账号 Token 刷新失败：走断路器指数退避，而非永久 isAvailable=false。
+  // 旧实现一次网络抖动就让账号在整个会话内被踢出轮换（成功刷新也不会恢复 isAvailable）。
   markNeedsRefresh(accountId: string): void {
     const account = this.accounts.get(accountId)
     if (account) {
       this.accounts.set(accountId, {
         ...account,
-        isAvailable: false
+        errorCount: (account.errorCount || 0) + 1,
+        lastUsed: Date.now()
       })
     }
   }
