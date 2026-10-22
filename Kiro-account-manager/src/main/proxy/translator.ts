@@ -384,7 +384,7 @@ export function openaiToKiro(
             modelId,
             origin,
             images: userImages.length > 0 ? userImages : undefined,
-            documents: userDocuments.length > 0 ? userDocuments : undefined,
+            documents: userDocuments.length > 0 ? dedupeDocumentNames(userDocuments) : undefined,
             ...(messageCachePoint ? { cachePoint: messageCachePoint } : {})
           }
         })
@@ -539,7 +539,7 @@ export function openaiToKiro(
     },
     {
       cachePoint: currentCachePoint,
-      documents,
+      documents: dedupeDocumentNames(documents),
       conversationId: request.conversation_id,
       context: request.kiro_context
     },
@@ -605,14 +605,14 @@ function parseOpenAIFileData(fileData: string, name: string): KiroDocument {
   if (dataUrlMatch) {
     return {
       format: normalizeDocumentFormat(dataUrlMatch[1], name),
-      name,
+      name: sanitizeDocumentName(name),
       source: { bytes: dataUrlMatch[2] }
     }
   }
 
   return {
     format: normalizeDocumentFormat(undefined, name),
-    name,
+    name: sanitizeDocumentName(name),
     source: { bytes: fileData }
   }
 }
@@ -646,15 +646,31 @@ function parseClaudeDocumentSource(source: NonNullable<ClaudeContentBlock['sourc
   throw new Error(`Unsupported document source type: ${source.type}`)
 }
 
-// 文档名按 Bedrock DocumentBlock 规则清洗：仅允许字母数字、单个空白、连字符、圆括号、方括号
-// （format 已在清洗前从原始名推断，扩展名丢失不影响）
+// 文档名按 Kiro/Bedrock 规则清洗（INVALID_DOCUMENT_NAME）：1-200 字符，仅 ASCII 字母数字、空白、
+// 连字符、下划线、圆括号、方括号，且不能有连续空白。中文等非 ASCII 字符一律替换。
+// format 已在清洗前从原始名推断，这里去掉扩展名不影响格式识别。
 function sanitizeDocumentName(name: string): string {
-  const cleaned = name
-    .replace(/[^\p{L}\p{N}\s\-()[\]]/gu, '-')
+  const base = name.replace(/\.[A-Za-z0-9]{1,10}$/, '')
+  const cleaned = base
+    .replace(/[^A-Za-z0-9 \-_()[\]]/g, '_')
     .replace(/\s+/g, ' ')
-    .trim()
+    .replace(/_{2,}/g, '_')
+    .replace(/^[\s_-]+|[\s_-]+$/g, '')
     .slice(0, 200)
-  return cleaned || 'document'
+    .trim()
+  // 全是非 ASCII（如纯中文文件名）时清洗后没有字母数字，退回通用名
+  return /[A-Za-z0-9]/.test(cleaned) ? cleaned : 'document'
+}
+
+// 同一条消息内文档名需唯一：重名追加 (2)、(3)…
+function dedupeDocumentNames(documents: KiroDocument[]): KiroDocument[] {
+  const seen = new Map<string, number>()
+  for (const doc of documents) {
+    const count = (seen.get(doc.name) || 0) + 1
+    seen.set(doc.name, count)
+    if (count > 1) doc.name = `${doc.name.slice(0, 190)} (${count})`
+  }
+  return documents
 }
 
 // 标准化图像格式
@@ -903,7 +919,7 @@ export function claudeToKiro(
               modelId,
               origin,
               images: finalUserImages.length > 0 ? finalUserImages : undefined,
-              documents: finalUserDocuments.length > 0 ? finalUserDocuments : undefined,
+              documents: finalUserDocuments.length > 0 ? dedupeDocumentNames(finalUserDocuments) : undefined,
               ...(finalCachePoint ? { cachePoint: finalCachePoint } : {})
             }
             // 如果有 toolResults，放入 userInputMessageContext
@@ -942,7 +958,7 @@ export function claudeToKiro(
           modelId,
           origin,
           images: pendingUserImages.length > 0 ? pendingUserImages : undefined,
-          documents: pendingUserDocuments.length > 0 ? pendingUserDocuments : undefined,
+          documents: pendingUserDocuments.length > 0 ? dedupeDocumentNames(pendingUserDocuments) : undefined,
           ...(pendingUserCachePoint ? { cachePoint: pendingUserCachePoint } : {})
         }
         if (pendingToolResults.length > 0) {
@@ -1036,7 +1052,7 @@ export function claudeToKiro(
     },
     {
       cachePoint: currentCachePoint,
-      documents,
+      documents: dedupeDocumentNames(documents),
       conversationId: request.conversation_id,
       context: request.kiro_context
     },
