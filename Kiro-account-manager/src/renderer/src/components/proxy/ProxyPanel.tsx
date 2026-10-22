@@ -269,8 +269,16 @@ export function ProxyPanel() {
     try {
       const selMode = override?.mode ?? config.multiAccountSelectionMode ?? 'all'
       const selGroupIds = override?.groupIds ?? config.multiAccountGroupIds ?? []
+      // 使用量已满（current >= limit）的账号不进池；已过重置日期的视为已恢复，保留
+      const now = Date.now()
+      const isUsageFull = (acc: { usage?: { current?: number; limit?: number; nextResetDate?: string } }): boolean => {
+        const limit = acc.usage?.limit ?? 0
+        if (limit <= 0 || (acc.usage?.current ?? 0) < limit) return false
+        const resetAt = acc.usage?.nextResetDate ? Date.parse(acc.usage.nextResetDate) : NaN
+        return !(Number.isFinite(resetAt) && resetAt <= now)
+      }
       let candidates = Array.from(accounts.values())
-        .filter(acc => acc.status === 'active' && acc.credentials?.accessToken)
+        .filter(acc => acc.status === 'active' && acc.credentials?.accessToken && !isUsageFull(acc))
 
       // 多账号轮询 + 'groups' 范围：按选中分组过滤（'__ungrouped__' 表示未分组账号）
       if (config.enableMultiAccount && selMode === 'groups') {
@@ -296,7 +304,10 @@ export function ProxyPanel() {
           authMethod: acc.credentials?.authMethod,
           provider: acc.credentials?.provider || acc.idp,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
-          groupId: acc.groupId
+          groupId: acc.groupId,
+          // 透传使用量：池内 isQuotaExhausted 据此判断，运行中用满后也会被跳过
+          quotaUsed: acc.usage?.current,
+          quotaLimit: acc.usage?.limit
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)

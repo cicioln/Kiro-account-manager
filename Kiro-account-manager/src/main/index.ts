@@ -2225,8 +2225,17 @@ function createWindow(): void {
             return p.url
           }
 
+          // 使用量已满（current >= limit）的账号不进池；已过重置日期的视为已恢复，保留（与 ProxyPanel.syncAccounts 一致）
+          const now = Date.now()
+          const isUsageFull = (acc: any): boolean => {
+            const limit = acc.usage?.limit ?? 0
+            if (limit <= 0 || (acc.usage?.current ?? 0) < limit) return false
+            const resetAt = acc.usage?.nextResetDate ? Date.parse(acc.usage.nextResetDate) : NaN
+            return !(Number.isFinite(resetAt) && resetAt <= now)
+          }
+
           const proxyAccounts = Object.values(accountData.accounts)
-            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken && !isUsageFull(acc))
             .map((acc: any) => {
               const provider = acc.credentials?.provider || acc.idp
               const authMethod = acc.credentials?.authMethod
@@ -2246,7 +2255,9 @@ function createWindow(): void {
                 region: acc.credentials?.region || 'us-east-1',
                 authMethod,
                 provider,
-                proxyUrl: buildProxyUrl(acc.id)
+                proxyUrl: buildProxyUrl(acc.id),
+                quotaUsed: acc.usage?.current,
+                quotaLimit: acc.usage?.limit
               }
             })
           if (proxyAccounts.length > 0) {
