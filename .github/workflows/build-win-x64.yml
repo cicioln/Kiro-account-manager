@@ -14,7 +14,9 @@ env:
 
 jobs:
   build-windows-x64:
-    runs-on: windows-latest
+    # windows-latest 已切到 windows-2025-vs2026 镜像，node-gyp 识别不了 VS 2026，
+    # postinstall（electron-builder install-app-deps）重编 cbor-extract 会失败；固定用自带 VS 2022 的镜像
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
