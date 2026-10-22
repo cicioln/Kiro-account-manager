@@ -1,7 +1,8 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
-import { join } from 'path'
+import { join, resolve, dirname } from 'path'
+import { homedir } from 'os'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
@@ -561,7 +562,7 @@ function initProxyServer(): ProxyServer {
 }
 
 // ============ 隐私模式打开浏览器 ============
-import { exec, execSync } from 'child_process'
+import { execFile, execFileSync, execSync } from 'child_process'
 
 // 获取 Windows 默认浏览器
 function getWindowsDefaultBrowser(): string {
@@ -584,8 +585,70 @@ function getWindowsDefaultBrowser(): string {
   }
 }
 
+/**
+ * 解析 ~/.kiro/steering 下的文件路径；filename 来自渲染进程，必须防目录穿越。
+ * 只允许单层文件名 + .md 扩展名，否则 `../../xxx` 可读写/删除/用 openPath 打开（执行）任意文件。
+ */
+function resolveSteeringFilePath(filename: unknown): string {
+  if (typeof filename !== 'string' || !/^[^\\/:*?"<>|\0]+\.md$/i.test(filename) || filename.includes('..')) {
+    throw new Error('Invalid steering filename')
+  }
+  const steeringDir = join(homedir(), '.kiro', 'steering')
+  const resolved = resolve(steeringDir, filename)
+  if (dirname(resolved) !== resolve(steeringDir)) {
+    throw new Error('Invalid steering filename')
+  }
+  return resolved
+}
+
+/**
+ * 校验并规范化外部 URL：仅允许 http/https，返回 URL 解析后的标准形式（引号等字符已被百分号编码）。
+ * 用于所有交给系统浏览器 / 子进程的 URL，防止渲染进程传入的字符串被当作命令或 file:// 等协议执行。
+ */
+function sanitizeExternalUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw.length > 8192) return null
+  try {
+    const u = new URL(raw)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    return u.toString()
+  } catch {
+    return null
+  }
+}
+
+// 依次尝试候选 [程序, 参数]（execFile 不经过 shell，URL 只作为单个参数，杜绝命令注入），全部失败则用默认浏览器
+function tryLaunchBrowsers(candidates: Array<[string, string[]]>, url: string): void {
+  const [head, ...rest] = candidates
+  if (!head) {
+    console.log('[Browser] Fallback to default browser (non-private)')
+    void shell.openExternal(url)
+    return
+  }
+  execFile(head[0], head[1], { windowsHide: true }, (err) => {
+    if (err) tryLaunchBrowsers(rest, url)
+  })
+}
+
+// Windows 下通过注册表 App Paths 定位浏览器可执行文件（替代 `start <name>`，后者必须经过 cmd 解析）
+function resolveWindowsBrowserExe(name: string): string | null {
+  const exe = `${name}.exe`
+  try {
+    const out = execFileSync('reg', ['query', `HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exe}`, '/ve'], {
+      encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true
+    })
+    const m = out.match(/REG_SZ\s+(.+?)\s*$/m)
+    if (m) return m[1].replace(/^"|"$/g, '')
+  } catch { /* 未安装或未注册 */ }
+  return null
+}
+
 // 使用隐私模式打开浏览器
-function openBrowserInPrivateMode(url: string): void {
+function openBrowserInPrivateMode(rawUrl: string): void {
+  const url = sanitizeExternalUrl(rawUrl)
+  if (!url) {
+    console.warn('[Browser] Refused to open non-http(s) URL')
+    return
+  }
   const platform = process.platform
   console.log(`[Browser] Opening in private mode on ${platform}: ${url}`)
 
@@ -594,82 +657,33 @@ function openBrowserInPrivateMode(url: string): void {
       // Windows: 检测默认浏览器并使用对应的隐私模式参数
       const defaultBrowser = getWindowsDefaultBrowser()
       console.log(`[Browser] Detected default browser: ${defaultBrowser}`)
-      
-      let command = ''
-      switch (defaultBrowser) {
-        case 'chrome':
-          command = `start chrome --incognito "${url}"`
-          break
-        case 'msedge':
-          command = `start msedge -inprivate "${url}"`
-          break
-        case 'firefox':
-          command = `start firefox -private-window "${url}"`
-          break
-        case 'brave':
-          command = `start brave --incognito "${url}"`
-          break
-        case 'opera':
-          command = `start opera --private "${url}"`
-          break
-        default:
-          // 未知浏览器，尝试常见浏览器
-          console.log('[Browser] Unknown default browser, trying common browsers...')
-          exec(`start chrome --incognito "${url}"`, (err) => {
-            if (err) {
-              exec(`start msedge -inprivate "${url}"`, (err2) => {
-                if (err2) {
-                  exec(`start firefox -private-window "${url}"`, (err3) => {
-                    if (err3) {
-                      console.log('[Browser] Fallback to default browser (non-private)')
-                      shell.openExternal(url)
-                    }
-                  })
-                }
-              })
-            }
-          })
-          return
+      const privateFlag: Record<string, string> = {
+        chrome: '--incognito', msedge: '-inprivate', firefox: '-private-window', brave: '--incognito', opera: '--private'
       }
-      
-      exec(command, (err) => {
-        if (err) {
-          console.log(`[Browser] Failed to open ${defaultBrowser}, fallback to default`)
-          shell.openExternal(url)
-        }
-      })
+      const order = defaultBrowser in privateFlag ? [defaultBrowser] : ['chrome', 'msedge', 'firefox']
+      const candidates: Array<[string, string[]]> = []
+      for (const name of order) {
+        const exePath = resolveWindowsBrowserExe(name)
+        if (exePath) candidates.push([exePath, [privateFlag[name], url]])
+      }
+      tryLaunchBrowsers(candidates, url)
     } else if (platform === 'darwin') {
       // macOS: 尝试 Chrome -> Firefox -> 默认浏览器
-      exec(`open -na "Google Chrome" --args --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`open -a Firefox --args -private-window "${url}"`, (err2) => {
-            if (err2) {
-              console.log('[Browser] Fallback to default browser')
-              shell.openExternal(url)
-            }
-          })
-        }
-      })
+      tryLaunchBrowsers([
+        ['open', ['-na', 'Google Chrome', '--args', '--incognito', url]],
+        ['open', ['-a', 'Firefox', '--args', '-private-window', url]]
+      ], url)
     } else {
       // Linux: 尝试 Chrome -> Chromium -> Firefox
-      exec(`google-chrome --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`chromium --incognito "${url}"`, (err2) => {
-            if (err2) {
-              exec(`firefox -private-window "${url}"`, (err3) => {
-                if (err3) {
-                  console.log('[Browser] Fallback to default browser')
-                  shell.openExternal(url)
-                }
-              })
-            }
-          })
-        }
-      })
+      tryLaunchBrowsers([
+        ['google-chrome', ['--incognito', url]],
+        ['chromium', ['--incognito', url]],
+        ['firefox', ['-private-window', url]]
+      ], url)
     }
   } catch (error) {
     console.error('[Browser] Error opening in private mode:', error)
-    shell.openExternal(url)
+    void shell.openExternal(url)
   }
 }
 
@@ -2390,8 +2404,21 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    // 仅放行 http/https：shell.openExternal 打开 file:// 或自定义协议可直接执行本地程序
+    const safeUrl = sanitizeExternalUrl(details.url)
+    if (safeUrl) void shell.openExternal(safeUrl)
     return { action: 'deny' }
+  })
+
+  // 禁止主窗口被导航到外部页面（外部页面会获得 preload 暴露的全部 IPC 能力）
+  mainWindow.webContents.on('will-navigate', (event, navUrl) => {
+    const devUrl = process.env['ELECTRON_RENDERER_URL']
+    const isInternal = navUrl.startsWith('file://') || (is.dev && !!devUrl && navUrl.startsWith(devUrl))
+    if (!isInternal) {
+      event.preventDefault()
+      const safeUrl = sanitizeExternalUrl(navUrl)
+      if (safeUrl) void shell.openExternal(safeUrl)
+    }
   })
 
   // HMR for renderer base on electron-vite cli.
@@ -5902,11 +5929,8 @@ app.whenReady().then(async () => {
   // IPC: 打开指定的 Steering 文件
   ipcMain.handle('open-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
+      const filePath = resolveSteeringFilePath(filename)
+
       shell.openPath(filePath)
       return { success: true }
     } catch (error) {
@@ -6001,11 +6025,8 @@ app.whenReady().then(async () => {
   // IPC: 读取 Steering 文件内容
   ipcMain.handle('read-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
       const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
+      const filePath = resolveSteeringFilePath(filename)
       
       if (!fs.existsSync(filePath)) {
         return { success: false, error: '文件不存在' }
@@ -6027,8 +6048,8 @@ app.whenReady().then(async () => {
       const path = await import('path')
       const homeDir = os.homedir()
       const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const filePath = path.join(steeringPath, filename)
-      
+      const filePath = resolveSteeringFilePath(filename)
+
       // 确保目录存在
       if (!fs.existsSync(steeringPath)) {
         fs.mkdirSync(steeringPath, { recursive: true })
@@ -7128,11 +7149,8 @@ app.whenReady().then(async () => {
   // IPC: 删除 Steering 文件
   ipcMain.handle('delete-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
       const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
+      const filePath = resolveSteeringFilePath(filename)
       
       if (!fs.existsSync(filePath)) {
         return { success: false, error: '文件不存在' }

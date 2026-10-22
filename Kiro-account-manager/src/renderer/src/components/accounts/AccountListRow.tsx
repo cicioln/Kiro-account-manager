@@ -112,7 +112,8 @@ function AccountListRowComponent({
     }
     return Math.floor(value).toLocaleString()
   }
-  const percentUsed = account.usage.percentUsed * 100
+  // 旧数据 / 导入账号可能缺 percentUsed，直接相乘会显示 NaN%
+  const percentUsed = Number.isFinite(account.usage?.percentUsed) ? account.usage.percentUsed * 100 : 0
   const isHighUsage = percentUsed > 80
   const isCritical = percentUsed > 100
 

@@ -1145,9 +1145,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       return normalized || 'Google'
     }
 
+    // 去重：同一 refreshToken 已存在（或本批次内重复）则跳过。
+    // 重复账号会并发刷新同一个 refreshToken，token 轮换后其中一个立即作废
+    const existingRefreshTokens = new Set(
+      Array.from(get().accounts.values()).map(a => a.credentials?.refreshToken).filter(Boolean) as string[]
+    )
+
     // 批量构造账号对象 + 一次 set，避免 N 次 new Map(O(n²)) 与 N 次 re-render
     const newAccounts: Account[] = []
     for (const item of items) {
+      if (item.refreshToken && existingRefreshTokens.has(item.refreshToken)) {
+        result.failed++
+        result.errors.push({ id: item.email, error: 'Duplicate account (refreshToken already exists)' })
+        continue
+      }
+      if (item.refreshToken) existingRefreshTokens.add(item.refreshToken)
       try {
         const now = Date.now()
         const id = uuidv4()

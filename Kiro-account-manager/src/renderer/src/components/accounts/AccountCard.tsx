@@ -667,10 +667,10 @@ export const AccountCard = memo(function AccountCard({
                   "font-mono font-medium tabular-nums",
                   isCritical ? "text-destructive" : isHighUsage ? "text-warning" : "text-foreground"
                 )}>
-                   {(account.usage.percentUsed * 100).toFixed(usagePrecision ? 2 : 0)}%
+                   {((Number.isFinite(account.usage?.percentUsed) ? account.usage.percentUsed : 0) * 100).toFixed(usagePrecision ? 2 : 0)}%
                    {isCritical && (
                      <span className="ml-1.5 text-[10px] text-red-600 font-semibold">
-                       (+{((account.usage.percentUsed - 1) * 100).toFixed(usagePrecision ? 2 : 0)}% {isEn ? 'over' : '超'})
+                       (+{(((Number.isFinite(account.usage?.percentUsed) ? account.usage.percentUsed : 0) - 1) * 100).toFixed(usagePrecision ? 2 : 0)}% {isEn ? 'over' : '超'})
                      </span>
                    )}
                 </span>
