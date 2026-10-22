@@ -35,6 +35,7 @@ export interface OpenAIContentPart {
   file?: { filename?: string; file_data?: string }
   source?: ClaudeDocumentSource
   name?: string
+  title?: string
   cache_control?: ClaudeCacheControl
 }
 
@@ -199,6 +200,8 @@ export interface ClaudeContentBlock {
   source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | ClaudeDocumentSource
   id?: string
   name?: string
+  /** Anthropic document block 的可选标题（官方字段，客户端不会发送 name） */
+  title?: string
   input?: unknown
   tool_use_id?: string
   content?: string | ClaudeContentBlock[]
@@ -208,6 +211,7 @@ export interface ClaudeContentBlock {
 export type ClaudeDocumentSource =
   | { type: 'base64'; media_type: string; data: string }
   | { type: 'text'; media_type?: string; data: string }
+  | { type: 'content'; content: string | Array<{ type: string; text?: string }> }
 
 export interface ClaudeTool {
   name: string

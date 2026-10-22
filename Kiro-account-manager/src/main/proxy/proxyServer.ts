@@ -36,6 +36,9 @@ import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
+// SSE 心跳间隔：需明显小于 Cloudflare 等反代的空闲断开阈值（~100-120s）
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000
+
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
@@ -941,6 +944,38 @@ export class ProxyServer {
 
   private isResponseClosed(res: http.ServerResponse): boolean {
     return res.writableEnded || res.destroyed
+  }
+
+  /**
+   * 写 SSE 响应头并启动心跳。
+   * 背景：Cloudflare 等反代对 ~100-120s 内无数据的连接会直接断开；上游首 token 慢、
+   * 长 thinking、账号重试/切换或 /v1/responses 的非流式等待期间下游可能长时间零字节。
+   * 心跳每 15s 写一次：Claude 格式发官方 `event: ping`，其余格式发 SSE 注释行（客户端忽略）。
+   * 定时器随响应 finish/close 自动清理；写缓冲已满时跳过本次，避免加重背压。
+   */
+  private writeSseHead(res: http.ServerResponse, format: 'claude' | 'comment'): void {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    res.flushHeaders()
+    const frame = format === 'claude'
+      ? `event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`
+      : `: keepalive\n\n`
+    const timer = setInterval(() => {
+      if (this.isResponseClosed(res)) {
+        clearInterval(timer)
+        return
+      }
+      if (res.writableNeedDrain) return
+      res.write(frame)
+    }, SSE_HEARTBEAT_INTERVAL_MS)
+    timer.unref?.()
+    const stop = (): void => clearInterval(timer)
+    res.once('finish', stop)
+    res.once('close', stop)
   }
 
   /**
@@ -2248,7 +2283,7 @@ export class ProxyServer {
 
       if (isStream) {
         // SSE 流式
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+        this.writeSseHead(res, 'comment')
         return new Promise<void>((resolve) => {
           callKiroApiStream(
             account as ProxyAccount,
@@ -2657,11 +2692,8 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
       if (processedRequest.stream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        })
+        // 心跳在 callWithRetry 等待完整结果期间保持连接活跃
+        this.writeSseHead(res, 'comment')
         const responseId = `resp_${uuidv4()}`
         res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`)
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -2763,11 +2795,7 @@ export class ProxyServer {
     signal?: AbortSignal
   ): Promise<void> {
     if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
+      this.writeSseHead(res, 'comment')
     }
 
     const id = streamId || `chatcmpl-${uuidv4()}`
@@ -3062,11 +3090,7 @@ export class ProxyServer {
     simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
   ): Promise<void> {
     if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
+      this.writeSseHead(res, 'claude')
     }
 
     const id = msgId || `msg_${uuidv4()}`

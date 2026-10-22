@@ -573,10 +573,8 @@ function extractOpenAIContent(msg: OpenAIMessage): { content: string; images: Ki
           }
           documents.push(parseOpenAIFileData(part.file.file_data, name))
         } else if (part.source) {
-          if (!part.name) {
-            throw new Error(`${part.type} requires name`)
-          }
-          documents.push(parseClaudeDocumentSource(part.source, part.name))
+          const name = part.name || part.title || `document-${documents.length + 1}`
+          documents.push(parseClaudeDocumentSource(part.source, name))
         } else {
           throw new Error(`${part.type} requires file_data or source`)
         }
@@ -623,18 +621,40 @@ function parseClaudeDocumentSource(source: NonNullable<ClaudeContentBlock['sourc
   if (source.type === 'base64') {
     return {
       format: normalizeDocumentFormat(source.media_type, name),
-      name,
+      name: sanitizeDocumentName(name),
       source: { bytes: source.data }
     }
   }
   if (source.type === 'text') {
     return {
       format: normalizeDocumentFormat(source.media_type, name),
-      name,
+      name: sanitizeDocumentName(name),
       source: { bytes: Buffer.from(source.data, 'utf8').toString('base64') }
     }
   }
+  if (source.type === 'content') {
+    // Anthropic custom content document：content 为字符串或 text block 数组，拼成纯文本
+    const text = typeof source.content === 'string'
+      ? source.content
+      : source.content.map(b => (b.type === 'text' ? b.text || '' : '')).join('\n')
+    return {
+      format: 'txt',
+      name: sanitizeDocumentName(name),
+      source: { bytes: Buffer.from(text, 'utf8').toString('base64') }
+    }
+  }
   throw new Error(`Unsupported document source type: ${source.type}`)
+}
+
+// 文档名按 Bedrock DocumentBlock 规则清洗：仅允许字母数字、单个空白、连字符、圆括号、方括号
+// （format 已在清洗前从原始名推断，扩展名丢失不影响）
+function sanitizeDocumentName(name: string): string {
+  const cleaned = name
+    .replace(/[^\p{L}\p{N}\s\-()[\]]/gu, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200)
+  return cleaned || 'document'
 }
 
 // 标准化图像格式
@@ -1049,10 +1069,9 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
           source: { bytes: block.source.data }
         })
       } else if (block.type === 'document' && block.source) {
-        if (!block.name) {
-          throw new Error('document requires name')
-        }
-        documents.push(parseClaudeDocumentSource(block.source, block.name))
+        // Anthropic 官方 document block 只有可选的 title，没有 name；缺省时按序号生成
+        const name = block.name || block.title || `document-${documents.length + 1}`
+        documents.push(parseClaudeDocumentSource(block.source, name))
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         let resultContent = ''
         // Kiro tool_result.content 只支持 text，但用户层 images 可以承载图片。
