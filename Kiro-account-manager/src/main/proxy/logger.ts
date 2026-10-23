@@ -393,9 +393,23 @@ export function interceptConsole(): void {
     return { category: 'App', message: first }
   }
 
+  // Error 的 message/stack 是不可枚举属性，直接存入日志会被 JSON 序列化成 {}，丢失错误原因。
+  // undici 的网络错误（如 "terminated"）真正原因在 cause 里（UND_ERR_SOCKET / ECONNRESET 等），一并展开。
+  const serializeError = (err: Error, depth = 0): Record<string, unknown> => {
+    const out: Record<string, unknown> = { name: err.name, message: err.message }
+    const code = (err as { code?: unknown }).code
+    if (code !== undefined) out.code = code
+    if (err.stack) out.stack = err.stack.split('\n').slice(0, 6).join('\n')
+    const cause = (err as { cause?: unknown }).cause
+    if (cause instanceof Error && depth < 3) out.cause = serializeError(cause, depth + 1)
+    else if (cause !== undefined) out.cause = String(cause)
+    return out
+  }
+  const toLoggable = (v: unknown): unknown => (v instanceof Error ? serializeError(v) : v)
+
   const buildEntry = (args: unknown[], level: 'INFO' | 'WARN' | 'ERROR'): LogEntry => {
     const { category, message } = parseConsoleCategory(args)
-    const rest = args.slice(1)
+    const rest = args.slice(1).map(toLoggable)
     // data: 后续参数（对象/数组保留结构，字符串拼接）
     let data: unknown = undefined
     if (rest.length === 1) {
