@@ -26,7 +26,7 @@ function App(): React.JSX.Element {
     flushSaveImmediately,
     accounts,
     activeAccountId,
-    setActiveAccount,
+    switchToAccount,
     checkAndRefreshExpiringTokens,
     updateAccountStatus,
     updateAccount
@@ -39,8 +39,12 @@ function App(): React.JSX.Element {
 
     const currentIndex = activeAccounts.findIndex(acc => acc.id === activeAccountId)
     const nextIndex = (currentIndex + 1) % activeAccounts.length
-    setActiveAccount(activeAccounts[nextIndex].id)
-  }, [accounts, activeAccountId, setActiveAccount])
+    // 走完整切号流程（写 IDE/CLI token），而不是只改 store 里的激活标记
+    const target = activeAccounts[nextIndex]
+    switchToAccount(target.id).then((result) => {
+      if (!result.success) console.warn(`[Tray] Switch to ${target.email} failed: ${result.error}`)
+    }).catch((e) => console.warn('[Tray] Switch to next account failed:', e))
+  }, [accounts, activeAccountId, switchToAccount])
 
   // 托盘信息防抖：账号 Map 频繁变更（后台刷新风暴）时合并 N 次 IPC 为 1 次
   const trayDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -107,11 +111,20 @@ function App(): React.JSX.Element {
   useEffect(() => {
     if (typeof window.api.onKiroIdeTokenChanged !== 'function') return
     const unsubscribe = window.api.onKiroIdeTokenChanged((data) => {
-      console.log(`[App] Kiro IDE refreshed token for account ${data.accountId} (${data.reason}), reloading accounts...`)
-      loadFromStorage().catch((e) => console.warn('[App] reload after IDE token change failed:', e))
+      console.log(`[App] Kiro IDE refreshed token for account ${data.accountId} (${data.reason}), merging credentials...`)
+      // 只合并该账号磁盘上的最新 credentials，不做整份 loadFromStorage：
+      // 整份重载会覆盖尚在防抖中的未保存修改，并重复触发 startAutoSwitch 等副作用
+      window.api.loadAccounts().then((d) => {
+        const diskAcc = d?.accounts?.[data.accountId] as { credentials?: Record<string, unknown> } | undefined
+        const current = useAccountsStore.getState().accounts.get(data.accountId)
+        if (!diskAcc?.credentials || !current) return
+        updateAccount(data.accountId, {
+          credentials: { ...current.credentials, ...diskAcc.credentials }
+        })
+      }).catch((e) => console.warn('[App] merge after IDE token change failed:', e))
     })
     return unsubscribe
-  }, [loadFromStorage])
+  }, [updateAccount])
 
   // 反代关键事件 → 触发 webhook（v1.8 新增）
   // 由 main/proxyServer 内置的 webhookTrigger 通过 IPC 推送过来，统一在 renderer 调 useWebhookStore

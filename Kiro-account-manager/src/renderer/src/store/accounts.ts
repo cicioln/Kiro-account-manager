@@ -12,8 +12,7 @@ import type {
   AccountImportItem,
   BatchOperationResult,
   AccountSubscription,
-  SubscriptionType,
-  IdpType
+  SubscriptionType
 } from '../types/account'
 import type {
   ProxyEntry,
@@ -348,6 +347,8 @@ interface AccountsActions {
 
   // 激活账号
   setActiveAccount: (id: string | null) => void
+  // 完整切号流程（写 IDE/CLI token + 同步 refresh 后凭证 + 激活），与 AccountCard 手动切换一致
+  switchToAccount: (id: string) => Promise<{ success: boolean; error?: string }>
   getActiveAccount: () => Account | null
 
   // 分组操作
@@ -767,6 +768,88 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     return activeAccountId ? accounts.get(activeAccountId) ?? null : null
   },
 
+  switchToAccount: async (id) => {
+    const account = get().accounts.get(id)
+    if (!account) return { success: false, error: 'Account not found' }
+    const { credentials } = account
+    const { switchTarget } = get()
+
+    // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
+    if (!credentials.refreshToken) {
+      return { success: false, error: 'Incomplete credentials' }
+    }
+    if (credentials.authMethod !== 'social' && (!credentials.clientId || !credentials.clientSecret)) {
+      return { success: false, error: 'Incomplete credentials' }
+    }
+
+    let success = true
+    let errorMsg = ''
+
+    try {
+      if (switchTarget === 'ide' || switchTarget === 'both') {
+        const result = await window.api.switchAccount({
+          accessToken: credentials.accessToken,
+          refreshToken: credentials.refreshToken,
+          clientId: credentials.clientId || '',
+          clientSecret: credentials.clientSecret || '',
+          region: credentials.region || 'us-east-1',
+          startUrl: credentials.startUrl,
+          authMethod: credentials.authMethod,
+          provider: credentials.provider,
+          profileArn: account.profileArn,
+          accountId: account.id
+        })
+        if (!result.success) {
+          success = false
+          errorMsg = result.error || ''
+        } else if (result.refreshedCredentials) {
+          // 同步 main 进程 refresh 后的最新 credentials 到 store，避免留下已被 rotate 作废的 refreshToken
+          const rc = result.refreshedCredentials
+          set((state) => {
+            const accounts = new Map(state.accounts)
+            const acc = accounts.get(id)
+            if (acc) {
+              accounts.set(id, {
+                ...acc,
+                credentials: {
+                  ...acc.credentials,
+                  accessToken: rc.accessToken,
+                  refreshToken: rc.refreshToken,
+                  expiresAt: Date.now() + rc.expiresIn * 1000
+                }
+              })
+            }
+            return { accounts }
+          })
+          get().saveToStorage()
+        }
+      }
+      if (switchTarget === 'cli' || switchTarget === 'both') {
+        // IDE 切换可能已 refresh 并 rotate refreshToken，读取最新 credentials，避免把已作废的 token 写给 CLI
+        const latest = get().accounts.get(id)?.credentials ?? credentials
+        const result = await window.api.switchAccountCli({
+          accessToken: latest.accessToken,
+          refreshToken: latest.refreshToken || credentials.refreshToken,
+          clientId: credentials.clientId,
+          clientSecret: credentials.clientSecret,
+          region: credentials.region || 'us-east-1',
+          profileArn: account.profileArn,
+          provider: credentials.provider
+        })
+        if (!result.success && switchTarget === 'cli') { success = false; errorMsg = result.error || '' }
+      }
+    } catch (err) {
+      success = false
+      errorMsg = err instanceof Error ? err.message : String(err)
+    }
+
+    // 仅在写入 IDE/CLI 成功后才标记为激活，避免 UI 与 IDE 实际账号不一致
+    if (success) {
+      await get().setActiveAccount(id)
+    }
+    return success ? { success } : { success, error: errorMsg }
+  },
+
   // ==================== 分组操作 ====================
 
   addGroup: (groupData) => {
@@ -1139,7 +1222,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 验证 idp 是否有效
     const validIdps = ['Google', 'Github', 'BuilderId'] as const
-    const normalizeIdp = (idp?: string): IdpType => {
+    const normalizeIdp = (idp?: string): 'Google' | 'Github' | 'BuilderId' => {
       if (!idp) return 'Google'
       const normalized = validIdps.find(v => v.toLowerCase() === idp.toLowerCase())
       return normalized || 'Google'
@@ -1164,6 +1247,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const now = Date.now()
         const id = uuidv4()
         const machineId = generateRandomMachineId()
+        const idp = normalizeIdp(item.idp as string)
+        // 无 clientId/clientSecret 的 Google/Github 账号是社交登录，必须标记 authMethod，
+        // 否则 main 进程会走 OIDC 刷新（空 clientId）而必然失败
+        const authMethod: 'IdC' | 'social' =
+          (!item.clientId && !item.clientSecret && idp !== 'BuilderId') ? 'social' : 'IdC'
 
         const account: Account = {
           id,
@@ -1173,7 +1261,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           email: item.email,
           password: item.password,
           nickname: item.nickname,
-          idp: normalizeIdp(item.idp as string),
+          idp,
           credentials: {
             accessToken: item.accessToken || '',
             csrfToken: item.csrfToken || '',
@@ -1181,7 +1269,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             clientId: item.clientId,
             clientSecret: item.clientSecret,
             region: item.region || 'us-east-1',
-            expiresAt: now + 3600 * 1000
+            authMethod,
+            provider: idp,
+            // 没有 accessToken 时立即视为过期，让首次自动刷新马上执行
+            expiresAt: item.accessToken ? now + 3600 * 1000 : now
           },
           subscription: {
             type: 'Free'
@@ -1239,14 +1330,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       })
     }
     
-    // 去重：文件内部去重
-    const seenEmails = new Set<string>()
+    // 去重：文件内部去重（与 isAccountExists 一致，按 邮箱+provider 判重，允许同邮箱不同登录方式）
+    const seenKeys = new Set<string>()
     const seenUserIds = new Set<string>()
     const uniqueAccounts = data.accounts.filter(acc => {
-      if (seenEmails.has(acc.email) || (acc.userId && seenUserIds.has(acc.userId))) {
+      const key = `${acc.email}|${acc.credentials?.provider ?? ''}`
+      if (seenKeys.has(key) || (acc.userId && seenUserIds.has(acc.userId))) {
         return false
       }
-      seenEmails.add(acc.email)
+      seenKeys.add(key)
       if (acc.userId) seenUserIds.add(acc.userId)
       return true
     })
@@ -1739,6 +1831,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             bindMachineIdToAccount: false,
             useBindedMachineId: true
           },
+          batchImportConcurrency: data.batchImportConcurrency ?? 100,
+          loginPrivateMode: data.loginPrivateMode ?? false,
+          originalMachineId: data.originalMachineId ?? null,
+          originalBackupTime: data.originalBackupTime ?? null,
           accountMachineIds: data.accountMachineIds ?? {},
           machineIdHistory: data.machineIdHistory ?? [],
           proxyPool: data.proxyPool
@@ -1835,6 +1931,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoRefreshEnabled,
       autoRefreshInterval,
       autoRefreshConcurrency,
+      autoRefreshSyncInfo,
       statusCheckInterval,
       privacyMode,
       usagePrecision,
@@ -1847,7 +1944,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       theme,
       darkMode,
       language,
+      batchImportConcurrency,
+      loginPrivateMode,
       machineIdConfig,
+      originalMachineId,
+      originalBackupTime,
       accountMachineIds,
       machineIdHistory,
       proxyPool,
@@ -1868,6 +1969,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoRefreshEnabled,
           autoRefreshInterval,
           autoRefreshConcurrency,
+          autoRefreshSyncInfo,
           statusCheckInterval,
           privacyMode,
           usagePrecision,
@@ -1880,7 +1982,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           theme,
           darkMode,
           language,
+          // 之前遗漏未持久化的设置项，重启后会被重置为默认值
+          batchImportConcurrency,
+          loginPrivateMode,
           machineIdConfig,
+          // 原始机器码备份必须持久化，否则重启后会把已修改的机器码误当作“原始”备份
+          originalMachineId,
+          originalBackupTime,
           accountMachineIds,
           machineIdHistory,
           proxyPool: Object.fromEntries(proxyPool),
@@ -2133,7 +2241,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   checkAndAutoSwitch: async () => {
-    const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
+    const { autoSwitchThreshold, checkAccountStatus, switchToAccount } = get()
     const activeAccount = get().getActiveAccount()
     
     if (!activeAccount) {
@@ -2158,9 +2266,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       console.log(`[AutoSwitch] Account ${updatedAccount.email} reached threshold, switching...`)
       
       // 查找可用的账号
-      const availableAccount = Array.from(accounts.values()).find(acc => {
+      // 使用 await 之后的最新快照，避免基于过期的状态/余额选号
+      const availableAccount = Array.from(get().accounts.values()).find(acc => {
         // 排除当前账号
         if (acc.id === activeAccount.id) return false
+        // 仅选择状态正常的账号（排除 expired / error / unknown 等）
+        if (acc.status !== 'active') return false
         // 排除被封禁的账号
         if (isBannedAccountError(acc.lastError)) return false
         // 排除余额不足的账号
@@ -2171,56 +2282,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       if (availableAccount) {
         console.log(`[AutoSwitch] Switching to: ${availableAccount.email}`)
-        setActiveAccount(availableAccount.id)
-        // 根据 switchTarget 设置决定切换目标
-        const { switchTarget: target } = get()
-        const creds = availableAccount.credentials
-        if (target === 'ide' || target === 'both') {
-          const switchResult = await window.api.switchAccount({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId || '',
-            clientSecret: creds.clientSecret || '',
-            region: creds.region || 'us-east-1',
-            startUrl: creds.startUrl,
-            authMethod: creds.authMethod,
-            provider: creds.provider,
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            accountId: availableAccount.id
-          })
-          // 把 main 进程 refresh 后的最新 credentials 同步回 store，
-          // 否则 store 里的 refreshToken 仍是 v1（已被服务端 rotate 作废），下次任何 refresh 都会失败
-          if (switchResult?.success && switchResult.refreshedCredentials) {
-            const rc = switchResult.refreshedCredentials
-            set((state) => {
-              const accounts = new Map(state.accounts)
-              const acc = accounts.get(availableAccount.id)
-              if (acc) {
-                accounts.set(availableAccount.id, {
-                  ...acc,
-                  credentials: {
-                    ...acc.credentials,
-                    accessToken: rc.accessToken,
-                    refreshToken: rc.refreshToken,
-                    expiresAt: Date.now() + rc.expiresIn * 1000
-                  }
-                })
-              }
-              return { accounts }
-            })
-            get().saveToStorage()
-          }
-        }
-        if (target === 'cli' || target === 'both') {
-          window.api.switchAccountCli?.({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId,
-            clientSecret: creds.clientSecret,
-            region: creds.region || 'us-east-1',
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            provider: creds.provider
-          }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
+        // 先写 IDE/CLI token，成功后才激活（统一走 switchToAccount）
+        const result = await switchToAccount(availableAccount.id)
+        if (!result.success) {
+          console.warn(`[AutoSwitch] Switch to ${availableAccount.email} failed: ${result.error}`)
         }
       } else {
         console.log('[AutoSwitch] No available account to switch to')
@@ -2571,6 +2636,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       return { accounts }
     })
+    // 刷新可能返回 rotate 后的新 refreshToken，必须落盘，否则崩溃或 reload 会留下已作废的旧 token
+    get().saveToStorage()
   },
 
   // 处理后台检查结果（兼容入口；高频场景请走 applyBackgroundCheckResults 批量）
@@ -2680,6 +2747,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       return { accounts }
     })
+    // 防抖落盘，避免检查结果只停留在内存中被 reload 覆盖
+    get().saveToStorage()
   },
 
   // ==================== 定时自动保存 ====================

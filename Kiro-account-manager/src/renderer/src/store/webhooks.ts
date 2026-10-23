@@ -132,13 +132,14 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
     const webhook = get().webhooks.get(id)
     if (!webhook) return { success: false, error: 'Webhook 不存在' }
     try {
-      await sendWebhook(webhook, {
+      const result = await sendWebhook(webhook, {
         title: '🧪 测试通知',
         message: '这是来自 Kiro 账号管理器的测试消息。如果你看到这条消息，说明 Webhook 配置正确。',
         level: 'info',
         fields: { 时间: new Date().toLocaleString('zh-CN') }
       })
-      return { success: true }
+      // 返回真实发送结果（sendWebhook 内部吞掉错误，不能默认成功）
+      return result
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
@@ -197,11 +198,11 @@ function checkAndRecordRate(webhookId: string): boolean {
  * 按 webhook 类型构造消息体并 POST（含重试 + 速率限制）
  * 网络错误不会抛到调用方（仅 console.warn），避免影响主业务流程
  */
-async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Promise<void> {
+async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Promise<{ success: boolean; error?: string }> {
   // C9: 速率限制
   if (!checkAndRecordRate(webhook.id)) {
     console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} rate limit exceeded (>${MAX_PER_MINUTE}/min), drop`)
-    return
+    return { success: false, error: 'rate limit exceeded' }
   }
 
   const body = buildWebhookBody(webhook, payload)
@@ -218,25 +219,24 @@ async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Prom
       console.log(`[Webhook] Retry ${attempt}/${RETRY_COUNT} for ${webhook.kind} ${webhook.label || webhook.id}`)
     }
     try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 8000)
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      })
-      clearTimeout(timer)
-      if (resp.ok) {
+      // 渲染进程 CSP 为 default-src 'self'，直接 fetch 外部地址会被拦截；
+      // 改由 main 进程代发（webhook-send IPC，net.fetch，同时规避 CORS）
+      const resp = await window.api.webhookSend(url, JSON.stringify(body), { 'Content-Type': 'application/json' })
+      if (resp.success) {
         if (attempt > 0) {
           console.log(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} succeeded on retry ${attempt}`)
         }
-        return
+        return { success: true }
+      }
+      // 网络错误 / 超时：main 返回 error 且无 status
+      if (!resp.status) {
+        lastError = new Error(resp.error || 'network error')
+        continue
       }
       // 4xx 客户端错误（除 408/429）不重试
       if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
         console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} HTTP ${resp.status} (no retry)`)
-        return
+        return { success: false, error: resp.error || `HTTP ${resp.status}` }
       }
       lastError = new Error(`HTTP ${resp.status}`)
     } catch (err) {
@@ -244,6 +244,7 @@ async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Prom
     }
   }
   console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} failed after ${RETRY_COUNT} retries:`, lastError)
+  return { success: false, error: lastError instanceof Error ? lastError.message : String(lastError) }
 }
 
 function buildTelegramUrl(webhook: WebhookEntry): string {

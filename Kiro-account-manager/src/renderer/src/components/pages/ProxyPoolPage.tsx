@@ -407,7 +407,8 @@ export function ProxyPoolPage(): React.ReactNode {
     const tick = (): void => {
       const now = Date.now()
       if (now - lastAutoValidateRef.current < intervalMin * 60_000) return
-      const enabledIds = Array.from(proxyPool.values())
+      // 在 tick 内读取最新代理池，避免把 proxyPool 放进依赖导致每次变更都重建定时器、永远等不到 60s
+      const enabledIds = Array.from(useAccountsStore.getState().proxyPool.values())
         .filter((p) => p.enabled)
         .map((p) => p.id)
       if (enabledIds.length === 0) return
@@ -419,7 +420,7 @@ export function ProxyPoolPage(): React.ReactNode {
     // 每分钟检查一次
     const timer = setInterval(tick, 60_000)
     return () => clearInterval(timer)
-  }, [proxyPoolConfig.autoValidateIntervalMin, proxyPoolConfig.autoValidateConcurrency, proxyPool, validateProxiesBatch])
+  }, [proxyPoolConfig.autoValidateIntervalMin, proxyPoolConfig.autoValidateConcurrency, validateProxiesBatch])
 
   const handleAutoDistribute = useCallback((onlyUnbound: boolean) => {
     if (bindingStats.aliveProxyCount === 0) {

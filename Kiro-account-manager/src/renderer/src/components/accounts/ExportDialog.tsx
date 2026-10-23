@@ -38,22 +38,25 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
   // 生成导出内容
   const generateContent = (format: ExportFormat): string => {
     switch (format) {
-      case 'json':
+      case 'json': {
         // 使用 store 的 exportAccounts 函数导出完整数据
         const exportData = exportAccounts(accounts.map(a => a.id))
-        // 如果不包含凭证，移除敏感信息
+        // 如果不包含凭证，移除敏感信息（含 clientSecret 与注册密码）
         if (!includeCredentials) {
           exportData.accounts = exportData.accounts.map(acc => ({
             ...acc,
+            password: undefined,
             credentials: {
               ...acc.credentials,
               accessToken: '',
               refreshToken: '',
-              csrfToken: ''
+              csrfToken: '',
+              clientSecret: undefined
             }
           }))
         }
         return JSON.stringify(exportData, null, 2)
+      }
 
       case 'oidc': {
         // 精简 JSON：只含关键凭证（邮箱/密码/refreshToken/clientId/clientSecret/provider）
@@ -96,7 +99,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           return lines.join('\n')
         }).join('\n\n---\n\n')
 
-      case 'csv':
+      case 'csv': {
         // CSV 格式：包含凭证时可用于导入
         const headers = includeCredentials 
           ? ['邮箱', '昵称', '登录方式', 'RefreshToken', 'ClientId', 'ClientSecret', 'Region']
@@ -125,6 +128,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
         return '\ufeff' + [headers, ...rows].map(row => 
           row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')
         ).join('\n')
+      }
 
       case 'kami':
         // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret----登录方式
