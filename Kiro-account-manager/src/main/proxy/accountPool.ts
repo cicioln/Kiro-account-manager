@@ -140,6 +140,10 @@ export class AccountPool {
 
       // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
+        // round-robin: 选中即推进指针，否则并发请求（成功回调前）会全部落到同一个账号
+        if (this.strategy === 'round-robin') {
+          this.currentIndex = (idx + 1) % accountList.length
+        }
         return account
       }
     }
@@ -354,8 +358,9 @@ export class AccountPool {
         if (this.strategy === 'sticky') {
           // 粘滞: 成功后将全局索引固定在这个账号 (保留 prompt cache 命中)
           this.currentIndex = successIndex
-        } else {
-          // round-robin: 成功后指向下一个账号 (满足负载均衡)
+        } else if (this.currentIndex === successIndex) {
+          // round-robin: 指针通常已在 getNextAccount 选中时推进；仅当指针仍停在该账号
+          // （经其他途径选中）时才推进，避免并发请求先后完成把指针拨回去
           this.currentIndex = (successIndex + 1) % accountList.length
         }
       }
@@ -445,24 +450,34 @@ export class AccountPool {
   }
 
   // 获取配额状态摘要
-  getQuotaStatus(): { total: number; available: number; exhausted: number; cooldown: number } {
+  // 每个账号恰好落入一个桶：suspended / exhausted / available / cooldown（断路器退避及其他暂不可用）
+  // 旧实现只按 cooldownUntil（从未被赋值）计 cooldown，退避中的账号和封禁账号不进任何桶
+  getQuotaStatus(): { total: number; available: number; exhausted: number; cooldown: number; suspended: number } {
     const now = Date.now()
     const all = Array.from(this.accounts.values())
     let available = 0
     let exhausted = 0
     let cooldown = 0
+    let suspended = 0
 
     for (const account of all) {
-      if (this.isQuotaExhausted(account, now)) {
+      if (this.isSuspended(account)) {
+        suspended++
+      } else if (this.isQuotaExhausted(account, now)) {
         exhausted++
-      } else if (account.cooldownUntil && account.cooldownUntil > now) {
-        cooldown++
       } else if (this.isAccountAvailable(account, now, false)) {
         available++
+      } else {
+        cooldown++
       }
     }
 
-    return { total: all.length, available, exhausted, cooldown }
+    return { total: all.length, available, exhausted, cooldown, suspended }
+  }
+
+  // 确定性可用检查（不带概率重试）：供会话亲和等场景判断粘滞账号是否仍健康
+  isAccountUsable(account: ProxyAccount): boolean {
+    return this.isAccountAvailable(account, Date.now(), false)
   }
 
   // 标记账号 Token 刷新失败：走断路器指数退避，而非永久 isAvailable=false。

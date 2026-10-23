@@ -20,6 +20,9 @@ export interface LoggerConfig {
   logToConsole?: boolean
 }
 
+// 模块加载时保存原始 console.error（interceptConsole 之前），供日志流错误处理使用
+const rawConsoleError = console.error.bind(console)
+
 const DEFAULT_CONFIG: LoggerConfig = {
   enabled: false,
   maxFileSize: 10 * 1024 * 1024, // 10MB
@@ -62,7 +65,14 @@ class ProxyLogger {
       // 创建新的日志文件
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
       this.currentLogFile = path.join(this.config.logDir, `proxy-${timestamp}.log`)
-      this.logStream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
+      const stream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
+      // 必须监听 error：打开/写入失败（EACCES/ENOSPC/文件被锁）会异步触发 'error'，
+      // 无监听器时 Node 会抛出未捕获异常导致主进程崩溃。使用未被拦截的 console.error 避免递归。
+      stream.on('error', (err) => {
+        rawConsoleError('[ProxyLogger] log stream error:', err)
+        if (this.logStream === stream) this.logStream = null
+      })
+      this.logStream = stream
       this.currentFileSize = 0
 
       this.info('Logger', 'Log file initialized', { file: this.currentLogFile })
