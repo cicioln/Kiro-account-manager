@@ -1107,6 +1107,8 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
         // Kiro tool_result.content 只支持 text，但用户层 images 可以承载图片。
         // 把内嵌 image block 提取到外层 images，避免「读取本地图片」这类场景图像内容被静默丢弃。
         let extractedImageCount = 0
+        // 同理：Claude Code 的 Read 读取 PDF 时返回 tool_result 内嵌 document block，提取到外层 documents
+        let extractedDocumentCount = 0
         if (typeof block.content === 'string') {
           resultContent = block.content || '(empty)'
         } else if (Array.isArray(block.content)) {
@@ -1128,16 +1130,28 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
                   // 不支持的格式：跳过但不抛错（保留旧行为，避免整轮失败）
                 }
               }
+            } else if (b.type === 'document' && b.source) {
+              try {
+                const name = b.name || b.title || `document-${documents.length + 1}`
+                documents.push(parseClaudeDocumentSource(b.source, name))
+                extractedDocumentCount++
+              } catch {
+                // 不支持的 source 类型：跳过，与图片处理保持一致
+              }
             }
           }
           resultContent = textParts.join('')
+          const attachments: string[] = []
+          if (extractedImageCount > 0) attachments.push(`${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}`)
+          if (extractedDocumentCount > 0) attachments.push(`${extractedDocumentCount} document${extractedDocumentCount > 1 ? 's' : ''}`)
+          const attachmentNote = attachments.join(' and ')
           if (!resultContent) {
-            resultContent = extractedImageCount > 0
-              ? `(tool returned ${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}, attached to this message)`
+            resultContent = attachmentNote
+              ? `(tool returned ${attachmentNote}, attached to this message)`
               : '(no text output)'
-          } else if (extractedImageCount > 0) {
-            // 既有文本又有图片：在文本末尾提示模型有附图
-            resultContent += `\n\n[Tool also returned ${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}, attached to this message]`
+          } else if (attachmentNote) {
+            // 既有文本又有附件：在文本末尾提示模型附件位置
+            resultContent += `\n\n[Tool also returned ${attachmentNote}, attached to this message]`
           }
         } else if (block.content === undefined || block.content === null) {
           resultContent = '(no output)'
