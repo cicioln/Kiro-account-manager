@@ -118,7 +118,8 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      // 本地 K-Proxy 为 MITM 代理（自签证书），仅此路径跳过 TLS 校验
+      const agent = safeCreateProxyAgent(proxyUrl, { insecure: true })
       if (agent) return agent
     }
   }
@@ -376,7 +377,10 @@ async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: Abor
   const cached = codeWhispererModelCache.get(key)
   if (cached && Date.now() - cached.timestamp < CODEWHISPERER_MODEL_CACHE_TTL) return cached.models
   const models = await fetchKiroModels(account, signal)
-  codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
+  // 仅缓存非空结果：拉取失败（5xx/限流/token 过期）返回 []，缓存它会让 5 分钟内所有请求被静默降级
+  if (models.length > 0) {
+    codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
+  }
   return models
 }
 
@@ -385,7 +389,13 @@ async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModel
   if (!modelId) return CODEWHISPERER_DEFAULT_MODEL_ID
   if (isCodeWhispererModelId(modelId)) return modelId
   const models = await getCachedCodeWhispererModels(account, signal)
-  return models.find(model => matchesRequestedModel(model, modelId))?.modelId || CODEWHISPERER_DEFAULT_MODEL_ID
+  // 模型列表拉取失败时透传请求的模型 ID（由后端判定），不静默降级到 Sonnet 4
+  if (models.length === 0) return modelId
+  const matched = models.find(model => matchesRequestedModel(model, modelId))?.modelId
+  if (!matched) {
+    console.warn(`[Kiro API] CodeWhisperer model "${modelId}" not in ListAvailableModels → fallback to "${CODEWHISPERER_DEFAULT_MODEL_ID}"`)
+  }
+  return matched || CODEWHISPERER_DEFAULT_MODEL_ID
 }
 
 function getPayloadModelId(payload: KiroPayload): string | undefined {
@@ -880,6 +890,14 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
   let currentTokens = estimatePayloadTokens(payload)
   const MAX_ITERATIONS = 100 // 防止极端情况死循环
 
+  // 首对是注入的系统提示（user(systemPrompt) + assistant('I will follow these instructions.')）时保留，
+  // 只裁剪其后的对话，否则第一轮就会把系统提示整体裁掉
+  const hasSystemPair = history.length >= 2 &&
+    history[1].assistantResponseMessage?.content === 'I will follow these instructions.' &&
+    !hasToolUses(history[1])
+  const systemPair = hasSystemPair ? history.slice(0, 2) : []
+  if (hasSystemPair) history = history.slice(2)
+
   while (currentTokens > maxTokens && history.length >= 4 && iterations < MAX_ITERATIONS) {
     iterations++
     // 计算安全切点：从 index 0 开始至少裁掉 1 组 (user+assistant)，并连带 toolUse/toolResult 配对
@@ -902,7 +920,7 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
     // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范
     history = ensureStartsWithUserMessage(history)
-    payload.conversationState.history = history
+    payload.conversationState.history = [...systemPair, ...history]
     currentTokens = estimatePayloadTokens(payload)
   }
 
@@ -1257,6 +1275,8 @@ export async function callKiroApiStream(
   }
 
   let lastError: Error | null = null
+  // 请求声明的工具名（泄漏 XML 救回只针对这些工具，避免把引用/讲解的 XML 当真实调用执行）
+  const declaredToolNames = getToolNames(payload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools ?? [])
 
   for (const endpoint of endpoints) {
     try {
@@ -1328,7 +1348,7 @@ export async function callKiroApiStream(
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr, declaredToolNames)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1359,17 +1379,20 @@ export async function callKiroApiStream(
               }
             }
           }
-          // 复用同一端点的配置（与主流程 profileArn 逻辑一致）
+          // 复用同一端点的配置（与主流程完全一致：所有端点均强制要求 profileArn）
           const resolvedArn2 = resolveProfileArn(account)
-          if (resolvedArn2 && (!isPlaceholderProfileArn(resolvedArn2) || isEnterprise)) {
+          if (resolvedArn2) {
             retryPayload.profileArn = resolvedArn2
-          } else {
-            delete retryPayload.profileArn
           }
           if (endpoint.name === 'CodeWhisperer') {
             applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
           }
           applyPayloadOrigin(retryPayload, endpoint.origin)
+          // AmazonQCLI 端点不支持 agentContinuationId/agentTaskType（与主流程一致）
+          if (endpoint.name === 'AmazonQCLI') {
+            delete (retryPayload.conversationState as unknown as Record<string, unknown>).agentContinuationId
+            delete (retryPayload.conversationState as unknown as Record<string, unknown>).agentTaskType
+          }
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
           const retryAgent = getNetworkAgent(account)
@@ -1377,7 +1400,7 @@ export async function callKiroApiStream(
             ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
             : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal })
           if (retryResponse.ok) {
-            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
+            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr, declaredToolNames)
             return
           }
           const retryBody = await retryResponse.text()
@@ -1477,7 +1500,8 @@ async function parseEventStream(
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  payloadStr?: string,     // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  declaredToolNames?: Set<string> // 本次请求声明的工具名：泄漏 <invoke> 仅对这些工具救回为 tool_use
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1569,6 +1593,12 @@ async function parseEventStream(
     if (i === -1) return false
     return !s.slice(i).includes('</invoke>')
   }
+  // 泄漏工具名是否为本次请求声明过的工具（未传 declaredToolNames 时保持旧行为：全部放行）
+  const isDeclaredTool = (name: string): boolean => !declaredToolNames || declaredToolNames.has(name)
+  // 末尾暂扣上限：避免普通文本被长期扣住导致流"假死"
+  const MAX_TAIL_HOLD = 512
+  // 未闭合 <invoke> 的暂扣上限（合法泄漏工具参数可能较长，如写文件内容）
+  const MAX_OPEN_INVOKE_HOLD = 32 * 1024
   const pendingToolTail = (s: string): number => {
     const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', 'count']
     let hold = 0
@@ -1582,9 +1612,13 @@ async function parseEventStream(
     }
     const cm = s.match(/count\s*$/)
     if (cm && cm[0].length > hold) hold = cm[0].length
-    const cm2 = s.match(/count\s*<[\s\S]*$/)
-    if (cm2 && cm2[0].length > hold) hold = cm2[0].length
-    return hold
+    // 仅当 count 后紧跟 '<invoke name=' / '<function_calls>' 的前缀时才暂扣
+    // （旧规则 /count\s*<[\s\S]*$/ 会误扣 "count < max" / "account <user>" 之后的全部文本）
+    const cm2 = s.match(/count\s*(<[a-z_ =>]*)$/)
+    if (cm2 && ('<invoke name='.startsWith(cm2[1]) || '<function_calls>'.startsWith(cm2[1])) && cm2[0].length > hold) {
+      hold = cm2[0].length
+    }
+    return Math.min(hold, MAX_TAIL_HOLD)
   }
   // 处理 leakCarry：正常文本经 onChunk 输出，泄漏工具暂存 leakedTools。isFlush 时吐出残留。
   // async：emit await onChunk 以保留 SSE 背压（慢客户端时暂停拉流，避免内存堆积）
@@ -1601,14 +1635,33 @@ async function parseEventStream(
       if (fi === -1) break
       const ci = leakCarry.indexOf('</invoke>', fi)
       if (ci === -1) break // 未闭合，等更多帧
-      await emit(stripToolPrefix(leakCarry.slice(0, fi)))
       const localRe = /<invoke name="([^"]+)">([\s\S]*?)<\/invoke>/g
       localRe.lastIndex = fi
       let m: RegExpExecArray | null
       let consumedEnd = ci + '</invoke>'.length
+      // 先收集本块所有相邻 invoke，判断是否含已声明工具
+      const blockMatches: RegExpExecArray[] = []
       while ((m = localRe.exec(leakCarry)) !== null) {
         if (m.index > consumedEnd + 30) break
-        const tool = parseInvokeBody(m[1], m[2])
+        blockMatches.push(m)
+        consumedEnd = m.index + m[0].length
+      }
+      if (!blockMatches.some(bm => isDeclaredTool(bm[1]))) {
+        // 无已声明工具（如用户让模型讲解/引用工具调用 XML）：原样当文本输出，不救回为 tool_use
+        const fcCloseRaw = leakCarry.slice(consumedEnd).match(/^\s*<\/function_calls>/)
+        if (fcCloseRaw) consumedEnd += fcCloseRaw[0].length
+        await emit(leakCarry.slice(0, consumedEnd))
+        leakCarry = leakCarry.slice(consumedEnd)
+        continue
+      }
+      await emit(stripToolPrefix(leakCarry.slice(0, fi)))
+      for (const bm of blockMatches) {
+        if (!isDeclaredTool(bm[1])) {
+          // 未声明的工具名：保留原文，不转换
+          await emit(bm[0])
+          continue
+        }
+        const tool = parseInvokeBody(bm[1], bm[2])
         leakedTools.push(tool)
         if (toolLeakDebug) {
           try {
@@ -1617,7 +1670,6 @@ async function parseEventStream(
             /* ignore */
           }
         }
-        consumedEnd = m.index + m[0].length
       }
       const fcClose = leakCarry.slice(consumedEnd).match(/^\s*<\/function_calls>/)
       if (fcClose) consumedEnd += fcClose[0].length
@@ -1631,6 +1683,14 @@ async function parseEventStream(
         return
       }
       const oi = leakCarry.indexOf('<invoke name=')
+      const openName = leakCarry.slice(oi).match(/^<invoke name="([^"]+)"/)
+      // 未闭合 invoke：工具名已可见且未声明，或工具名迟迟未出现且暂扣超过上限 → 直接当文本输出，避免流长期"假死"
+      // 已声明工具不设上限（合法的 Write/Edit 参数可能远超 32KB，提前吐出会把工具调用变成文本）
+      if ((openName && !isDeclaredTool(openName[1])) || (!openName && leakCarry.length - oi > MAX_OPEN_INVOKE_HOLD)) {
+        await emit(leakCarry)
+        leakCarry = ''
+        return
+      }
       const safe = stripToolPrefix(leakCarry.slice(0, oi))
       await emit(safe)
       leakCarry = leakCarry.slice(safe.length)
@@ -1697,21 +1757,28 @@ async function parseEventStream(
         // 提取 payload
         const payloadStart = 12 + headersLength
         const payloadEnd = totalLength - 4 // 减去 message CRC
-        
+
+        // AWS 异常帧：:message-type=exception/error，没有 :event-type。
+        // 必须在 JSON.parse 之前处理：非 JSON / 空 payload 的异常帧否则会被 SyntaxError 吞掉，
+        // 客户端收到截断的「成功」响应
+        if (messageType === 'exception' || messageType === 'error') {
+          const exText = payloadStart < payloadEnd ? new TextDecoder().decode(buffer.slice(payloadStart, payloadEnd)) : ''
+          let exEvent: Record<string, unknown> = {}
+          try {
+            const parsed = exText ? JSON.parse(exText) : {}
+            if (parsed && typeof parsed === 'object') exEvent = parsed as Record<string, unknown>
+          } catch { /* 非 JSON payload，使用原文 */ }
+          const exType = frameHeaders[':exception-type'] || frameHeaders[':error-code'] || (exEvent.__type as string | undefined) || 'StreamError'
+          const exMsg = (exEvent.message as string | undefined) || (exEvent.Message as string | undefined) || frameHeaders[':error-message'] || exText.slice(0, 300) || 'Unknown stream error'
+          throw new Error(`${exType}: ${exMsg}`)
+        }
+
         if (payloadStart < payloadEnd) {
           const payloadBytes = buffer.slice(payloadStart, payloadEnd)
-          
+
           try {
             const payloadText = new TextDecoder().decode(payloadBytes)
             const event = JSON.parse(payloadText)
-
-            // AWS 异常帧：:message-type=exception/error，没有 :event-type。
-            // 旧实现漏判导致流中途报错被吞，客户端收到空的/截断的「成功」响应
-            if (messageType === 'exception' || messageType === 'error') {
-              const exType = frameHeaders[':exception-type'] || frameHeaders[':error-code'] || event.__type || 'StreamError'
-              const exMsg = event.message || event.Message || frameHeaders[':error-message'] || payloadText.slice(0, 300)
-              throw new Error(`${exType}: ${exMsg}`)
-            }
 
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {

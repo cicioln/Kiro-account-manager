@@ -267,13 +267,24 @@ export function openAIChatToResponsesResponse(
 ): OpenAIResponsesResponse {
   const output: OpenAIResponseOutputItem[] = response.choices.flatMap<OpenAIResponseOutputItem>(choice => {
     if (choice.message.tool_calls?.length) {
-      return choice.message.tool_calls.map(toolCall => ({
+      const calls: OpenAIResponseOutputItem[] = choice.message.tool_calls.map(toolCall => ({
         type: 'function_call' as const,
         id: `fc_${uuidv4()}`,
         call_id: toolCall.id,
         name: toolCall.function.name,
         arguments: toolCall.function.arguments
       }))
+      // 伴随工具调用的助手文本放在 function_call 之前，避免丢失
+      const text = choice.message.content
+      if (typeof text === 'string' && text.trim()) {
+        calls.unshift({
+          type: 'message' as const,
+          id: `msg_${uuidv4()}`,
+          role: 'assistant' as const,
+          content: [{ type: 'output_text' as const, text }]
+        })
+      }
+      return calls
     }
     return [{
       type: 'message' as const,
@@ -347,8 +358,9 @@ export function openaiToKiro(
   }
 
   // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
+  // 仅精确到日期（YYYY-MM-DD）：毫秒级时间戳会让 history[0] 每次请求都变，破坏前缀缓存与会话指纹
+  const timestamp = new Date().toISOString().slice(0, 10)
+  systemPrompt = `[Context: Current date is ${timestamp}]\n\n${systemPrompt}`
 
   // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
   const executionDirective = `
@@ -371,6 +383,8 @@ export function openaiToKiro(
   let currentCachePoint: KiroCachePoint | undefined
   const images: KiroImage[] = []
   const documents: KiroDocument[] = []
+  // 当前这批 tool 消息返回的图片（flush 进 history 时随之挂上）
+  const pendingToolImages: KiroImage[] = []
   for (let i = 0; i < nonSystemMessages.length; i++) {
     const msg = nonSystemMessages[i]
     const isLast = i === nonSystemMessages.length - 1
@@ -452,7 +466,7 @@ export function openaiToKiro(
               textParts.push(part.text)
             } else if (part.type === 'image_url' && part.image_url?.url) {
               const img = parseImageUrl(part.image_url.url)
-              if (img) { images.push(img); extractedImageCount++ }
+              if (img) { pendingToolImages.push(img); extractedImageCount++ }
             }
           }
           rawText = textParts.join('')
@@ -485,16 +499,21 @@ export function openaiToKiro(
             content: 'Tool results provided.',
             modelId,
             origin,
+            // 本批工具返回的图片挂在对应的 history 消息上，不再累积到当前消息
+            images: pendingToolImages.length > 0 ? [...pendingToolImages] : undefined,
             userInputMessageContext: {
               toolResults: [...toolResults]
             }
           }
         })
-        // 清空已处理的 toolResults
+        // 清空已处理的 toolResults / 图片
         toolResults.length = 0
+        pendingToolImages.length = 0
       }
     }
   }
+  // 最后一批（未 flush 进 history）的工具图片随当前消息发送
+  images.push(...pendingToolImages)
 
   // 如果最后一条是 assistant 消息，自动发送 Continue（参考 Proxycast）
   if (history.length > 0 && history[history.length - 1].assistantResponseMessage && !currentContent) {
@@ -786,7 +805,8 @@ export function kiroToOpenaiResponse(
       index: 0,
       message: {
         role: 'assistant',
-        content: (restoredToolUses.length > 0 || !content?.trim()) ? null : content,
+        // 有工具调用时也保留伴随的助手文本（OpenAI 允许 content 与 tool_calls 同时存在）
+        content: content?.trim() ? content : null,
         ...(reasoningContent?.text ? { reasoning_content: reasoningContent.text } : {}),
         tool_calls: restoredToolUses.length > 0 ? restoredToolUses.map(tu => ({
           id: tu.toolUseId,
@@ -865,8 +885,9 @@ export function claudeToKiro(
   }
 
   // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
+  // 仅精确到日期（YYYY-MM-DD）：毫秒级时间戳会让 history[0] 每次请求都变，破坏前缀缓存与会话指纹
+  const timestamp = new Date().toISOString().slice(0, 10)
+  systemPrompt = `[Context: Current date is ${timestamp}]\n\n${systemPrompt}`
 
   // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
   const executionDirective = `
@@ -1294,7 +1315,8 @@ export function kiroToClaudeResponse(
   }
 
   const claudeUsage: ClaudeResponse['usage'] = {
-    input_tokens: usage.inputTokens,
+    // Kiro 的 inputTokens 是全量（含缓存），Anthropic 规范中 input_tokens 不含缓存部分（与流式 buildClaudeUsage 一致）
+    input_tokens: Math.max(0, usage.inputTokens - (usage.cacheWriteTokens || 0) - (usage.cacheReadTokens || 0)),
     output_tokens: usage.outputTokens
   }
   if (usage.cacheWriteTokens) {

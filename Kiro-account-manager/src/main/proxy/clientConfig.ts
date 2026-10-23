@@ -436,9 +436,11 @@ async function configureHermes(context: ProxyClientContext): Promise<Omit<ProxyC
 
   // 简单追加/替换 custom_providers 中的 kiro 条目
   let content = existing
-  const kiroProviderRegex = /^\s*- name:\s*kiro\b[\s\S]*?(?=^\s*- name:|^[a-z]|$)/gm
+  // 匹配 "- name: kiro" 行及其后所有更深缩进的续行（含中间空行），不含末尾换行；
+  // 旧正则懒匹配 + 多行 $ 只替换首行，残留旧 base_url/api_key 等导致 YAML 重复键
+  const kiroProviderRegex = /^([ \t]*)- name:[ \t]*kiro\b.*(?:\r?\n(?:\1[ \t]+\S.*|[ \t]*(?=\r?\n)))*/m
   if (kiroProviderRegex.test(content)) {
-    content = content.replace(kiroProviderRegex, providerBlock + newline)
+    content = content.replace(kiroProviderRegex, providerBlock)
   } else if (content.includes('custom_providers:')) {
     content = content.replace(/(custom_providers:\s*)/, `$1${newline}${providerBlock}${newline}`)
   } else {
