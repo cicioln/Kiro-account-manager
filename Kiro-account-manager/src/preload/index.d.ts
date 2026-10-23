@@ -21,6 +21,8 @@ interface AccountData {
   theme?: string
   darkMode?: boolean
   language?: 'auto' | 'en' | 'zh'
+  batchImportConcurrency?: number
+  loginPrivateMode?: boolean
   // 机器码管理
   machineIdConfig?: {
     autoSwitchOnAccountChange: boolean
@@ -248,6 +250,9 @@ interface KiroApi {
 
   // 退出登录 - 清除本地 SSO 缓存
   logoutAccount: () => Promise<{ success: boolean; deletedCount?: number; error?: string }>
+
+  // Webhook 推送（主进程 net.fetch POST，仅允许 http/https，约 15s 超时）
+  webhookSend: (url: string, body: string, headers?: Record<string, string>) => Promise<{ success: boolean; status?: number; error?: string }>
 
   // 文件操作
   exportToFile: (data: string, filename: string) => Promise<boolean>

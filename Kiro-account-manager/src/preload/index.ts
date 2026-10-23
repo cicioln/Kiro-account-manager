@@ -184,6 +184,11 @@ const api = {
     return ipcRenderer.invoke('logout-account')
   },
 
+  // Webhook 推送：由主进程 net.fetch 发送 POST（绕过渲染进程 CORS）
+  webhookSend: (url: string, body: string, headers?: Record<string, string>): Promise<{ success: boolean; status?: number; error?: string }> => {
+    return ipcRenderer.invoke('webhook-send', url, body, headers)
+  },
+
   // 文件操作 - 导出到文件
   exportToFile: (data: string, filename: string): Promise<boolean> => {
     return ipcRenderer.invoke('export-to-file', data, filename)
@@ -331,21 +336,6 @@ const api = {
     error?: string
   }> => {
     return ipcRenderer.invoke('poll-iam-sso-auth', region || 'us-east-1')
-  },
-
-  // 完成 IAM SSO 登录 (用授权码换取 token)
-  completeIamSsoLogin: (code: string): Promise<{
-    success: boolean
-    completed?: boolean
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('complete-iam-sso-login', code)
   },
 
   // 取消 IAM SSO 登录

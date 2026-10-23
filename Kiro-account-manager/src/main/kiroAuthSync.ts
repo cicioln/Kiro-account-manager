@@ -121,6 +121,41 @@ function computeClientIdHash(startUrl?: string): string {
 }
 
 /**
+ * 原子写入：先写同目录临时文件再 rename 覆盖，避免 IDE watchFile 读到半截 JSON / 崩溃留下损坏文件
+ */
+async function writeFileAtomic(target: string, content: string): Promise<void> {
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await fs.writeFile(tmp, content, { mode: 0o600 })
+    try {
+      await fs.chmod(tmp, 0o600)
+    } catch {
+      /* Windows 上 chmod 为 no-op，忽略 */
+    }
+    try {
+      await fs.rename(tmp, target)
+    } catch (renameErr) {
+      // Windows 上目标文件被其它进程占用时 rename 可能 EPERM/EBUSY，退回直接写
+      const code = (renameErr as NodeJS.ErrnoException)?.code
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw renameErr
+      await fs.writeFile(target, content, { mode: 0o600 })
+      try {
+        await fs.unlink(tmp)
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (e) {
+    try {
+      await fs.unlink(tmp)
+    } catch {
+      /* ignore */
+    }
+    throw e
+  }
+}
+
+/**
  * 以与 Kiro IDE 完全兼容的格式写入 ~/.aws/sso/cache/kiro-auth-token.json
  * - mode 0o600：与 IDE 保持一致（writeTokenToDisk 用 0o600 即 384）
  * - social 与 IdC 字段顺序对齐 Kiro IDE 序列化结果，便于人工 diff
@@ -154,9 +189,7 @@ export async function writeKiroAuthTokenFile(
           profileArn: input.profileArn
         }
 
-  await fs.writeFile(KIRO_AUTH_TOKEN_PATH, JSON.stringify(tokenData, null, 2), {
-    mode: 0o600
-  })
+  await writeFileAtomic(KIRO_AUTH_TOKEN_PATH, JSON.stringify(tokenData, null, 2))
   // Windows 上 chmod 对 0o600 是 no-op 但不抛错；Linux/macOS 上保证权限正确
   try {
     await fs.chmod(KIRO_AUTH_TOKEN_PATH, 0o600)
@@ -175,7 +208,7 @@ export async function writeKiroAuthTokenFile(
       expiresAt: clientExpiresAt,
       scopes: KIRO_OIDC_SCOPES
     }
-    await fs.writeFile(clientRegPath, JSON.stringify(clientData, null, 2), { mode: 0o600 })
+    await writeFileAtomic(clientRegPath, JSON.stringify(clientData, null, 2))
     try {
       await fs.chmod(clientRegPath, 0o600)
     } catch {
@@ -184,6 +217,58 @@ export async function writeKiroAuthTokenFile(
   }
 
   return { tokenPath: KIRO_AUTH_TOKEN_PATH, clientRegPath }
+}
+
+/**
+ * 退出登录：只删除 Kiro 自己的文件（kiro-auth-token.json + Kiro 客户端注册文件），
+ * 不动 ~/.aws/sso/cache 下 AWS CLI / SDK / Toolkit 的其它 SSO 会话与客户端注册。
+ * 客户端注册文件识别：token 文件里的 clientIdHash、默认 startUrl 的 hash，以及 scopes 含 codewhisperer: 的 JSON。
+ */
+export async function clearKiroAuthFiles(): Promise<string[]> {
+  const deleted: string[] = []
+  const candidates = new Set<string>([KIRO_AUTH_TOKEN_PATH])
+  try {
+    const content = await fs.readFile(KIRO_AUTH_TOKEN_PATH, 'utf-8')
+    const parsed = JSON.parse(content) as KiroAuthTokenFile
+    if (parsed.clientIdHash && /^[a-f0-9]+$/i.test(parsed.clientIdHash)) {
+      candidates.add(path.join(KIRO_SSO_CACHE_DIR, `${parsed.clientIdHash}.json`))
+    }
+  } catch {
+    /* token 文件不存在或损坏 */
+  }
+  candidates.add(path.join(KIRO_SSO_CACHE_DIR, `${computeClientIdHash()}.json`))
+  try {
+    const files = await fs.readdir(KIRO_SSO_CACHE_DIR)
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue
+      const filePath = path.join(KIRO_SSO_CACHE_DIR, file)
+      if (candidates.has(filePath)) continue
+      try {
+        const data = JSON.parse(await fs.readFile(filePath, 'utf-8')) as { scopes?: unknown }
+        if (
+          Array.isArray(data.scopes) &&
+          data.scopes.some((s) => typeof s === 'string' && s.startsWith('codewhisperer:'))
+        ) {
+          candidates.add(filePath)
+        }
+      } catch {
+        /* 非 JSON 或读取失败，跳过 */
+      }
+    }
+  } catch {
+    /* 目录不存在 */
+  }
+  for (const filePath of candidates) {
+    try {
+      await fs.unlink(filePath)
+      deleted.push(filePath)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.warn('[KiroAuthSync] Failed to delete file:', filePath, e)
+      }
+    }
+  }
+  return deleted
 }
 
 export async function readKiroAuthTokenFile(): Promise<KiroAuthTokenFile | null> {

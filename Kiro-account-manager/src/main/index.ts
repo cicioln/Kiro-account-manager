@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, net } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join, resolve, dirname } from 'path'
@@ -24,6 +24,7 @@ import {
   parseAccessTokenClaims,
   watchKiroAuthTokenFile,
   resolveProfileArnForWrite,
+  clearKiroAuthFiles,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
@@ -160,7 +161,8 @@ function getNetworkAgent(): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      // K-Proxy 是本地 MITM 代理，使用自签证书，必须关闭 TLS 校验
+      const agent = safeCreateProxyAgent(proxyUrl, { insecure: true })
       if (agent) return agent
     }
   }
@@ -1503,9 +1505,22 @@ async function initStore(): Promise<void> {
 //
 // 账号匹配优先级（任一命中即视为同一账号）：
 //   1) accessToken JWT 解 sub，与反代 store 里某账号 cached accessToken claims 的 sub 一致
-//   2) lastSwitchedAccountId（反代刚 switch-account 过的那一个）
-//   3) refreshToken 旧值匹配（IDE 第一次自刷新前，磁盘 refresh 还等于 store 里的）
+//   2) refreshToken 旧值匹配（IDE 第一次自刷新前，磁盘 refresh 还等于 store 里的）
+//   3) lastSwitchedAccountId（反代刚 switch-account 过的那一个），需通过 provider/region + GetUserInfo 邮箱校验
 let stopKiroAuthTokenWatcher: (() => void) | null = null
+
+/**
+ * lastSwitchedAccountId 兜底校验：只有当磁盘 refreshToken 等于 store 中该账号当前保存的 refreshToken 时，
+ * 才认为 IDE 仍在使用该账号（用户可能已在 IDE 里直接登录了别的账号，此时不能覆盖 IDE 的 token 文件）
+ */
+function isLastSwitchedStillOnDisk(accountId: string | undefined, diskRefreshToken: string | undefined): boolean {
+  if (!accountId || !diskRefreshToken || lastSwitchedAccountId !== accountId) return false
+  const data = store?.get('accountData') as
+    | { accounts?: Record<string, { credentials?: { refreshToken?: string } }> }
+    | null
+    | undefined
+  return data?.accounts?.[accountId]?.credentials?.refreshToken === diskRefreshToken
+}
 
 function startKiroAuthTokenWatcher(): void {
   if (stopKiroAuthTokenWatcher) return
@@ -1547,7 +1562,7 @@ async function syncIdeTokenChangeToStore(token: {
     }
   }
   const accountData = store?.get('accountData') as
-    | { accounts?: Record<string, { id?: string; email?: string; credentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }> }
+    | { accounts?: Record<string, { id?: string; email?: string; machineId?: string; credentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number; provider?: string; authMethod?: string; region?: string } }> }
     | null
     | undefined
   if (!accountData?.accounts) {
@@ -1572,13 +1587,7 @@ async function syncIdeTokenChangeToStore(token: {
     }
   }
 
-  // 2) lastSwitchedAccountId 兜底
-  if (!matchedId && lastSwitchedAccountId && accountData.accounts[lastSwitchedAccountId]) {
-    matchedId = lastSwitchedAccountId
-    matchedReason = 'lastSwitchedAccountId fallback'
-  }
-
-  // 3) 旧 refreshToken 匹配
+  // 2) 旧 refreshToken / accessToken 精确匹配（先于 lastSwitched 兜底，避免误匹配）
   if (!matchedId) {
     for (const [id, acc] of Object.entries(accountData.accounts)) {
       if (acc.credentials?.accessToken === token.accessToken) {
@@ -1591,6 +1600,51 @@ async function syncIdeTokenChangeToStore(token: {
         break
       }
     }
+  }
+
+  // 3) lastSwitchedAccountId 兜底：IDE 自己轮换了不透明 token 时只能靠它匹配，
+  //    但用户可能已在 IDE 里直接登录了别的账号，因此必须做身份校验（provider/authMethod/region + GetUserInfo 邮箱）
+  if (!matchedId && lastSwitchedAccountId && accountData.accounts[lastSwitchedAccountId]) {
+    const candidate = accountData.accounts[lastSwitchedAccountId]
+    const cc = candidate.credentials
+    const norm = (v?: string): string => (v || '').toLowerCase()
+    const providerOk = !token.provider || !cc?.provider || norm(token.provider) === norm(cc.provider)
+    const authOk =
+      !token.authMethod ||
+      !cc?.authMethod ||
+      (token.authMethod === 'social') === (cc.authMethod === 'social')
+    const regionOk = !token.region || !cc?.region || norm(token.region) === norm(cc.region)
+    if (!providerOk || !authOk || !regionOk) {
+      console.warn(
+        `[KiroAuthSync] lastSwitchedAccountId fallback rejected: provider/authMethod/region mismatch ` +
+          `(disk ${token.provider}/${token.authMethod}/${token.region} vs store ${cc?.provider}/${cc?.authMethod}/${cc?.region})`
+      )
+      return
+    }
+    if (!candidate.email) {
+      console.warn('[KiroAuthSync] lastSwitchedAccountId fallback rejected: candidate has no email to verify')
+      return
+    }
+    try {
+      const info = await getUserInfo(
+        token.accessToken,
+        token.provider || cc?.provider || 'BuilderId',
+        candidate.machineId,
+        candidate.email
+      )
+      if (!info?.email || info.email.toLowerCase() !== candidate.email.toLowerCase()) {
+        console.warn(
+          `[KiroAuthSync] lastSwitchedAccountId fallback rejected: IDE token belongs to ${info?.email || 'unknown'}, ` +
+            `not ${candidate.email}`
+        )
+        return
+      }
+    } catch (e) {
+      console.warn('[KiroAuthSync] lastSwitchedAccountId fallback rejected: GetUserInfo failed:', e)
+      return
+    }
+    matchedId = lastSwitchedAccountId
+    matchedReason = 'lastSwitchedAccountId fallback (identity verified)'
   }
 
   if (!matchedId) {
@@ -1613,6 +1667,8 @@ async function syncIdeTokenChangeToStore(token: {
   }
 
   store!.set('accountData', accountData)
+  // 同步内存快照，避免关窗/退出时用旧 lastSavedData 回写覆盖新 token
+  lastSavedData = accountData
   console.log(
     `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
   )
@@ -1695,7 +1751,16 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
   console.log(
     `[ProactiveRenewal] Renewing token for IDE active account ${account.email || accountId}...`
   )
+  // 去重：与池内自刷新/后台批量刷新共用在途集合，避免对同一 refreshToken 并发刷新导致其中一个被 rotate 作废
+  if (poolRefreshInFlightIds.has(accountId)) {
+    console.log(`[ProactiveRenewal] Account ${accountId} refresh already in flight, reschedule later`)
+    scheduleProactiveRenewal(accountId, Date.now() + PROACTIVE_RENEWAL_LEAD_MS + 60_000)
+    return
+  }
+  // 账号绑定代理以反代账号池为准（store 账号通常没有 proxyUrl 字段）
+  const boundProxyUrl = proxyServer?.getAccountPool().getAccount(accountId)?.proxyUrl || account.proxyUrl
   let refreshResult
+  poolRefreshInFlightIds.add(accountId)
   try {
     refreshResult = await refreshTokenByMethod(
       creds.refreshToken,
@@ -1703,11 +1768,13 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       creds.clientSecret || '',
       creds.region || 'us-east-1',
       creds.authMethod,
-      account.proxyUrl
+      boundProxyUrl
     )
   } catch (e) {
     console.warn('[ProactiveRenewal] refreshTokenByMethod threw, stop scheduling:', e)
     return
+  } finally {
+    poolRefreshInFlightIds.delete(accountId)
   }
   if (!refreshResult.success || !refreshResult.accessToken) {
     console.warn(
@@ -1757,6 +1824,18 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       expiresAt: newExpiresAt
     }
     store.set('accountData', accountData)
+    // 同步内存快照，避免关窗/退出时用旧 lastSavedData 回写覆盖新 token
+    lastSavedData = accountData
+  }
+
+  // 2.5 写回反代账号池：否则池内仍是被 rotate 作废的旧 refreshToken
+  if (proxyServer?.getAccountPool().getAccount(accountId)) {
+    proxyServer.getAccountPool().updateAccount(accountId, {
+      accessToken: newAccess,
+      refreshToken: newRefresh,
+      expiresAt: newExpiresAt,
+      isAvailable: true
+    })
   }
 
   // 3. 通知 renderer reload
@@ -3074,7 +3153,7 @@ app.whenReady().then(async () => {
       try {
         const diskToken = await readKiroAuthTokenFile()
         const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-        const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
+        const matchByLastSwitch = isLastSwitchedStillOnDisk(account.id, diskToken?.refreshToken)
         if (matchByRefresh || matchByLastSwitch) {
           const resolvedProfileArn = resolveProfileArnForWrite({
             profileArn: account.profileArn,
@@ -3674,6 +3753,7 @@ app.whenReady().then(async () => {
     let completed = 0
     let success = 0
     let failed = 0
+    const rotatedTokens: Array<{ id: string; accessToken: string; refreshToken?: string; expiresAt: number }> = []
 
     // 串行处理每批，避免并发过高
     for (let i = 0; i < accounts.length; i += concurrency) {
@@ -3761,7 +3841,7 @@ app.whenReady().then(async () => {
                 try {
                   const diskToken = await readKiroAuthTokenFile()
                   const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-                  const matchByLastSwitch = lastSwitchedAccountId === account.id
+                  const matchByLastSwitch = isLastSwitchedStillOnDisk(account.id, diskToken?.refreshToken)
                   if (matchByRefresh || matchByLastSwitch) {
                     const resolvedProfileArn = resolveProfileArnForWrite({
                       profileArn: diskToken?.profileArn,
@@ -4007,6 +4087,16 @@ app.whenReady().then(async () => {
             success++
             completed++
 
+            // 无窗口时渲染进程收不到结果，收集轮换后的 token 由主进程直接落盘
+            if (account.id && newAccessToken && newExpiresIn !== undefined) {
+              rotatedTokens.push({
+                id: account.id,
+                accessToken: newAccessToken,
+                refreshToken: newRefreshToken,
+                expiresAt: Date.now() + newExpiresIn * 1000
+              })
+            }
+
             // 通知渲染进程更新账号
             mainWindow?.webContents.send('background-refresh-result', {
               id: account.id,
@@ -4048,6 +4138,38 @@ app.whenReady().then(async () => {
       // 批次间延迟，让主进程有喘息时间
       if (i + concurrency < accounts.length) {
         await new Promise(resolve => setTimeout(resolve, 100))
+      }
+    }
+
+    // 窗口不存在（如 macOS 关窗后常驻）时，直接把轮换后的 token 写回 store，
+    // 否则 store 仍保留已作废的旧 refreshToken，下次刷新/重启后必然失败
+    if (rotatedTokens.length > 0 && (!mainWindow || mainWindow.isDestroyed()) && store) {
+      try {
+        const data = store.get('accountData') as
+          | { accounts?: Record<string, { credentials?: Record<string, unknown> }> }
+          | null
+          | undefined
+        if (data?.accounts) {
+          let changed = 0
+          for (const t of rotatedTokens) {
+            const acc = data.accounts[t.id]
+            if (!acc) continue
+            acc.credentials = {
+              ...(acc.credentials || {}),
+              accessToken: t.accessToken,
+              ...(t.refreshToken ? { refreshToken: t.refreshToken } : {}),
+              expiresAt: t.expiresAt
+            }
+            changed++
+          }
+          if (changed > 0) {
+            store.set('accountData', data)
+            lastSavedData = data
+            console.log(`[BackgroundRefresh] No window: persisted ${changed} rotated token(s) to store`)
+          }
+        }
+      } catch (e) {
+        console.warn('[BackgroundRefresh] Failed to persist rotated tokens without window:', e)
       }
     }
 
@@ -4838,13 +4960,42 @@ app.whenReady().then(async () => {
       // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
       if (refreshToken) {
         console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+        // 去重：若池内/后台刷新正在刷同一账号，等待其完成（最多 30s），避免并发 rotate 作废其中一个
+        let waitedForInFlight = false
+        if (accountId && poolRefreshInFlightIds.has(accountId)) {
+          waitedForInFlight = true
+          for (let i = 0; i < 60 && poolRefreshInFlightIds.has(accountId); i++) {
+            await new Promise((r) => setTimeout(r, 500))
+          }
+        }
+        const pool = proxyServer?.getAccountPool()
+        const poolAccount = accountId ? pool?.getAccount(accountId) : undefined
+        const boundProxyUrl = poolAccount?.proxyUrl
+        // 等待过在途刷新时，renderer 传入的 refreshToken 可能已被 rotate 作废，改用池内最新值
+        const refreshTokenToUse =
+          waitedForInFlight && poolAccount?.refreshToken ? poolAccount.refreshToken : refreshToken
+        if (accountId) poolRefreshInFlightIds.add(accountId)
+        let refreshResult: Awaited<ReturnType<typeof refreshTokenByMethod>>
+        try {
+          refreshResult = await refreshTokenByMethod(refreshTokenToUse, clientId, clientSecret, region, authMethod, boundProxyUrl)
+        } finally {
+          if (accountId) poolRefreshInFlightIds.delete(accountId)
+        }
         if (refreshResult.success && refreshResult.accessToken) {
           finalAccessToken = refreshResult.accessToken
           // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
-          finalRefreshToken = refreshResult.refreshToken || refreshToken
+          finalRefreshToken = refreshResult.refreshToken || refreshTokenToUse
           finalExpiresIn = refreshResult.expiresIn ?? 3600
           console.log('[Switch Account] Token refreshed successfully (rotated refreshToken updated)')
+          // 写回反代账号池，避免池内保留已被 rotate 作废的旧 refreshToken
+          if (accountId && pool?.getAccount(accountId)) {
+            pool.updateAccount(accountId, {
+              accessToken: finalAccessToken,
+              refreshToken: finalRefreshToken,
+              expiresAt: Date.now() + finalExpiresIn * 1000,
+              isAvailable: true
+            })
+          }
         } else {
           // bug D 修复：refresh 失败不写文件 + 直接报错，避免给 IDE 留下"半坏"token
           const errMsg = refreshResult.error || 'Unknown refresh error'
@@ -5050,35 +5201,65 @@ app.whenReady().then(async () => {
 
   // IPC: 退出登录 - 清除本地 SSO 缓存
   ipcMain.handle('logout-account', async () => {
-    const os = await import('os')
-    const path = await import('path')
-    const { readdir, unlink } = await import('fs/promises')
-
     // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
     clearProactiveRenewal('logout-account')
     lastSwitchedAccountId = null
     lastWrittenTokenSignature = null
 
     try {
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      console.log('[Logout] Clearing SSO cache:', ssoCache)
-      
-      // 读取目录下所有文件
-      const files = await readdir(ssoCache).catch(() => [])
-      
-      // 删除所有文件
-      for (const file of files) {
-        const filePath = path.join(ssoCache, file)
-        await unlink(filePath).catch((e) => {
-          console.warn('[Logout] Failed to delete file:', filePath, e)
-        })
-      }
-      
-      console.log('[Logout] SSO cache cleared, deleted', files.length, 'files')
-      return { success: true, deletedCount: files.length }
+      // 只删除 Kiro 的 token 与客户端注册文件，保留 AWS CLI / SDK 等其它 SSO 会话
+      console.log('[Logout] Clearing Kiro auth files in SSO cache')
+      const deleted = await clearKiroAuthFiles()
+      console.log('[Logout] Kiro auth files cleared, deleted', deleted.length, 'files')
+      return { success: true, deletedCount: deleted.length }
     } catch (error) {
       console.error('[Logout] Error:', error)
       return { success: false, error: error instanceof Error ? error.message : '退出失败' }
+    }
+  })
+
+  // IPC: Webhook 推送（主进程 net.fetch POST，绕过渲染进程 CORS；仅允许 http/https，15s 超时）
+  ipcMain.handle('webhook-send', async (_event, url: unknown, body: unknown, headers?: unknown) => {
+    if (typeof url !== 'string' || typeof body !== 'string') {
+      return { success: false, error: 'Invalid arguments' }
+    }
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      return { success: false, error: 'Invalid URL' }
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { success: false, error: 'Only http/https URLs are allowed' }
+    }
+    const reqHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (headers && typeof headers === 'object') {
+      for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+        if (typeof v === 'string') reqHeaders[k] = v
+      }
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15000)
+    try {
+      const resp = await net.fetch(parsed.toString(), {
+        method: 'POST',
+        headers: reqHeaders,
+        body,
+        signal: controller.signal
+      })
+      // 读掉响应体释放连接
+      await resp.text().catch(() => '')
+      return resp.ok
+        ? { success: true, status: resp.status }
+        : { success: false, status: resp.status, error: `HTTP ${resp.status}` }
+    } catch (error) {
+      const aborted = controller.signal.aborted
+      return {
+        success: false,
+        error: aborted ? 'Request timed out' : error instanceof Error ? error.message : String(error)
+      }
+    } finally {
+      clearTimeout(timer)
     }
   })
 
@@ -7320,7 +7501,10 @@ if (!gotTheLock) {
 
     // 聚焦主窗口
     if (mainWindow) {
+      // 窗口可能已被隐藏到托盘（closeAction 'minimize'），需要 show() 才能看见
+      if (process.platform === 'darwin') app.dock?.show()
       if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
       mainWindow.focus()
     }
   })
@@ -7341,58 +7525,62 @@ app.on('window-all-closed', () => {
 })
 
 // 应用退出前注销 URI 协议处理器并保存数据
+// 注意：托盘「退出」和关闭对话框「退出」会先置 isQuitting=true 再 app.quit()，
+// 因此这里不能用 isQuitting 做重入保护，否则常见退出路径会跳过全部落盘逻辑
+let exitCleanupDone = false
+let exitCleanupStarted = false
 app.on('will-quit', async (event) => {
-  // 防止重复处理
-  if (isQuitting) return
-  
+  // 防止重复处理（cleanup 完成后 app.exit 不会再触发 will-quit，这里仅防并发重入）
+  if (exitCleanupDone) return
+  event.preventDefault()
+  if (exitCleanupStarted) return
+  exitCleanupStarted = true
+  isQuitting = true
+
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
 
-  // 防止应用立即退出，先保存数据
-  if (lastSavedData && store) {
-    event.preventDefault()
-    isQuitting = true
-    
-    // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
-    const forceQuitTimer = setTimeout(() => {
-      console.log('[Exit] Force quit due to timeout')
-      unregisterProtocol()
-      app.exit(0)
-    }, 3000)
-    
-    try {
-      console.log('[Exit] Saving data before quit...')
-      // 刷新待写入的防抖数据
-      flushStoreWrites()
+  // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
+  const forceQuitTimer = setTimeout(() => {
+    console.log('[Exit] Force quit due to timeout')
+    exitCleanupDone = true
+    unregisterProtocol()
+    app.exit(0)
+  }, 3000)
+
+  try {
+    console.log('[Exit] Saving data before quit...')
+    // 刷新待写入的防抖数据（无论 lastSavedData 是否存在都要执行）
+    flushStoreWrites()
+    if (lastSavedData && store) {
       store.set('accountData', lastSavedData)
       // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
-      await flushBackupNow()
-      // 强制落盘代理日志（异步节流中的尾巴数据）
-      try {
-        const { proxyLogStore } = await import('./proxy/logger')
-        await proxyLogStore.flushSaveNow()
-      } catch (err) {
-        console.error('[Exit] Failed to flush proxy logs:', err)
-      }
-      // 释放共享的 TLS ModuleClient（worker pool + DLL）
-      try {
-        const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
-        await shutdownTlsClientPool()
-      } catch (err) {
-        console.error('[Exit] Failed to shutdown TLS client pool:', err)
-      }
-      console.log('[Exit] Data saved successfully')
-    } catch (error) {
-      console.error('[Exit] Failed to save data:', error)
     }
-    
-    clearTimeout(forceQuitTimer)
-    unregisterProtocol()
-    app.exit(0)
-  } else {
-    unregisterProtocol()
+    await flushBackupNow()
+    console.log('[Exit] Data saved successfully')
+  } catch (error) {
+    console.error('[Exit] Failed to save data:', error)
   }
+  // 强制落盘代理日志（异步节流中的尾巴数据）
+  try {
+    const { proxyLogStore } = await import('./proxy/logger')
+    await proxyLogStore.flushSaveNow()
+  } catch (err) {
+    console.error('[Exit] Failed to flush proxy logs:', err)
+  }
+  // 释放共享的 TLS ModuleClient（worker pool + DLL）
+  try {
+    const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
+    await shutdownTlsClientPool()
+  } catch (err) {
+    console.error('[Exit] Failed to shutdown TLS client pool:', err)
+  }
+
+  clearTimeout(forceQuitTimer)
+  exitCleanupDone = true
+  unregisterProtocol()
+  app.exit(0)
 })
 
 // In this file you can include the rest of your app's specific main process
