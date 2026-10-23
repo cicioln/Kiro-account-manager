@@ -121,6 +121,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/** 可被 signal 提前唤醒的 sleep（取消注册时立即释放取码队列） */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleep(ms)
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((r) => {
+    const onAbort = (): void => { clearTimeout(t); r() }
+    const t = setTimeout(() => { signal.removeEventListener('abort', onAbort); r() }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /** 通过当前 URL + DOM 判断是否已登录 Proton Mail */
 async function checkLoggedIn(w: BrowserWindow): Promise<boolean> {
   const url = w.webContents.getURL()
@@ -347,10 +358,12 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
   // Proton 取码是「点开邮件读本地 DOM」，无网络 API 限流顾虑，且点开本身已自带耗时，
   // 故轮询间隔不沿用网络型邮箱的 intervalSec(默认3s)，钳到 ≤1s 让验证码到达后更快被读到。
   const pollMs = Math.min(Math.max(opts.intervalSec * 1000, 250), 1000)
+  // 以实际耗时为准（每轮扫描/点开/reload 都有额外耗时，按轮数计会远超 timeoutSec 并长期占住串行队列）
+  const deadline = Date.now() + opts.timeoutSec * 1000
   const maxRetries = Math.max(1, Math.floor((opts.timeoutSec * 1000) / pollMs))
   const script = buildScanScript(address)
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt === 1 || Date.now() < deadline; attempt++) {
     if (opts.signal?.aborted) throw new Error('注册已取消')
 
     // 每 ~20 轮 reload 一次兜底（防止 SPA 长时间不刷新漏收）
@@ -377,8 +390,9 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
     }
 
     if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 暂无验证码...`)
-    await sleep(pollMs)
+    await abortableSleep(pollMs, opts.signal)
   }
 
+  if (opts.signal?.aborted) throw new Error('注册已取消')
   throw new Error(`等待验证码超时 (${opts.timeoutSec}s)`)
 }

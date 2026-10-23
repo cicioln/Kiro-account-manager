@@ -53,16 +53,22 @@ export class MitmProxy {
     }
 
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
+      const srv = http.createServer((req, res) => {
         this.handleHttpRequest(req, res)
       })
+      this.server = srv
+      let listening = false
 
       // 处理 CONNECT 请求（HTTPS 隧道）
-      this.server.on('connect', (req, clientSocket: net.Socket, head) => {
+      srv.on('connect', (req, clientSocket: net.Socket, head) => {
         this.handleConnect(req, clientSocket, head)
       })
 
-      this.server.on('error', (error: NodeJS.ErrnoException) => {
+      srv.on('error', (error: NodeJS.ErrnoException) => {
+        // listen 失败时复位 this.server，否则 isRunning() 误报运行中、后续 start() 直接返回
+        if (!listening && this.server === srv) {
+          this.server = null
+        }
         if (error.code === 'EADDRINUSE') {
           console.error(`[MitmProxy] Port ${this.config.port} is already in use`)
           reject(new Error(`Port ${this.config.port} is already in use`))
@@ -73,7 +79,8 @@ export class MitmProxy {
         }
       })
 
-      this.server.listen(this.config.port, this.config.host, () => {
+      srv.listen(this.config.port, this.config.host, () => {
+        listening = true
         console.log(`[MitmProxy] Started on ${this.config.host}:${this.config.port}`)
         this.stats.startTime = Date.now()
         this.events.onStatusChange?.(true, this.config.port)
@@ -139,9 +146,16 @@ export class MitmProxy {
 
     proxyReq.on('error', (error) => {
       console.error('[MitmProxy] HTTP proxy error:', error)
-      res.writeHead(502)
-      res.end('Bad Gateway')
+      // 响应头已发出时不能再 writeHead（会抛 ERR_HTTP_HEADERS_SENT 导致主进程崩溃），直接断开
+      if (!res.headersSent) {
+        res.writeHead(502)
+        res.end('Bad Gateway')
+      } else {
+        res.destroy()
+      }
     })
+    req.on('error', () => proxyReq.destroy())
+    res.on('error', () => proxyReq.destroy())
 
     req.pipe(proxyReq)
   }
@@ -264,60 +278,99 @@ export class MitmProxy {
 
   /**
    * 处理解密后的 HTTPS 连接
+   * 每个 TLS 连接只处理一个请求：转发时强制 Connection: close，上游响应结束后关闭客户端连接，
+   * 客户端会为下一个请求重新建连（避免 keep-alive 后续请求被丢弃或绕过 Machine ID 替换）。
+   * 头部/请求体全程按 Buffer 处理，避免 UTF-8 解码破坏多字节字符或二进制内容。
    */
   private handleDecryptedConnection(
-    clientSocket: tls.TLSSocket, 
-    hostname: string, 
+    clientSocket: tls.TLSSocket,
+    hostname: string,
     port: number
   ): void {
-    let requestData = ''
-    let headersParsed = false
+    const MAX_HEADER_BYTES = 64 * 1024
+    let headerBuf: Buffer = Buffer.alloc(0)
+    // headers: 等待请求头；body: 按 Content-Length 收集请求体；stream: chunked 等无长度请求体直接流式转发；done: 已转发，忽略后续数据
+    let state: 'headers' | 'body' | 'stream' | 'done' = 'headers'
+    let finalHeaders = ''
     let contentLength = 0
-    let bodyReceived = 0
-    let modifiedHeaders: string = ''
-    let requestInfo: KProxyRequestInfo | null = null
+    const bodyChunks: Buffer[] = []
+    let bodyLen = 0
+    let streamWrite: ((chunk: Buffer) => void) | null = null
+
+    const tryFinishBody = (): void => {
+      if (bodyLen < contentLength) return
+      state = 'done'
+      // 超出 Content-Length 的部分属于下一个请求，Connection: close 下直接丢弃（客户端会重连）
+      const body = Buffer.concat(bodyChunks).subarray(0, contentLength)
+      bodyChunks.length = 0
+      const modifiedBody = this.modifyBody(body)
+      let headers = finalHeaders
+      if (modifiedBody !== body) {
+        // body 被修改，按实际字节数重算 Content-Length
+        headers = this.setHeader(headers, 'content-length', String(modifiedBody.length))
+      }
+      this.forwardRequest(headers, modifiedBody, hostname, port, clientSocket, false)
+    }
 
     clientSocket.on('data', (chunk: Buffer) => {
-      if (!headersParsed) {
-        requestData += chunk.toString()
-        const headerEnd = requestData.indexOf('\r\n\r\n')
-        
-        if (headerEnd !== -1) {
-          headersParsed = true
-          const headers = requestData.substring(0, headerEnd)
-          const body = requestData.substring(headerEnd + 4)
-          
-          // 解析并修改请求头
-          const { modified, newHeaders, info } = this.modifyHeaders(headers, hostname)
-          modifiedHeaders = newHeaders
-          requestInfo = info
-
-          // 记录请求
-          if (requestInfo) {
-            this.events.onRequest?.(requestInfo)
-            this.events.onMitmIntercept?.(hostname, modified)
+      if (state === 'headers') {
+        headerBuf = Buffer.concat([headerBuf, chunk])
+        const headerEnd = headerBuf.indexOf('\r\n\r\n')
+        if (headerEnd === -1) {
+          if (headerBuf.length > MAX_HEADER_BYTES) {
+            console.error(`[MitmProxy] Request headers too large for ${hostname}`)
+            clientSocket.destroy()
           }
-
-          // 获取 Content-Length
-          const clMatch = headers.match(/content-length:\s*(\d+)/i)
-          if (clMatch) {
-            contentLength = parseInt(clMatch[1], 10)
-          }
-
-          // 替换 body 中的 machineId
-          const modifiedBody = this.modifyBody(body)
-          if (modifiedBody !== body) {
-            // body 长度变了，更新 Content-Length
-            const newLength = contentLength - Buffer.byteLength(body) + Buffer.byteLength(modifiedBody)
-            modifiedHeaders = modifiedHeaders.replace(/content-length:\s*\d+/i, `content-length: ${newLength}`)
-            contentLength = newLength
-          }
-          bodyReceived = Buffer.byteLength(modifiedBody)
-
-          // 转发请求到目标服务器
-          this.forwardRequest(modifiedHeaders, modifiedBody, hostname, port, clientSocket, contentLength, bodyReceived)
+          return
         }
+        // 头部按 latin1 解码，字节一一对应，写回时不改变原始字节
+        const headers = headerBuf.subarray(0, headerEnd).toString('latin1')
+        const rest = headerBuf.subarray(headerEnd + 4)
+        headerBuf = Buffer.alloc(0)
+
+        // 解析并修改请求头
+        const { modified, newHeaders, info } = this.modifyHeaders(headers, hostname)
+        // 强制短连接：去掉原有的连接管理头，追加 Connection: close
+        finalHeaders = this.forceConnectionClose(newHeaders)
+
+        // 记录请求
+        this.events.onRequest?.(info)
+        this.events.onMitmIntercept?.(hostname, modified)
+
+        const isChunked = /^transfer-encoding:[^\r\n]*chunked/im.test(headers)
+        const clMatch = headers.match(/^content-length:\s*(\d+)\s*$/im)
+
+        if (isChunked) {
+          // 无法预知长度的请求体：不做 body 替换，后续字节原样流式转发
+          state = 'stream'
+          streamWrite = this.forwardRequest(finalHeaders, rest, hostname, port, clientSocket, true)
+          return
+        }
+
+        // 无 Content-Length 且非 chunked：按 HTTP/1.1 视为无请求体，多余字节属于流水线请求，丢弃（Connection: close 下客户端会重连）
+        contentLength = clMatch ? parseInt(clMatch[1], 10) : 0
+        if (contentLength > rest.length && /^expect:\s*100-continue\s*$/im.test(finalHeaders)) {
+          // 需先缓冲完整请求体再转发：代为应答 100 Continue，并去掉 Expect 头，避免客户端一直等待
+          finalHeaders = finalHeaders
+            .split('\r\n')
+            .filter((line, idx) => idx === 0 || !/^expect\s*:/i.test(line))
+            .join('\r\n')
+          clientSocket.write('HTTP/1.1 100 Continue\r\n\r\n')
+        }
+        state = 'body'
+        if (rest.length > 0) {
+          bodyChunks.push(rest)
+          bodyLen += rest.length
+        }
+        tryFinishBody()
+      } else if (state === 'body') {
+        bodyChunks.push(chunk)
+        bodyLen += chunk.length
+        tryFinishBody()
+      } else if (state === 'stream') {
+        streamWrite?.(chunk)
       }
+      // done: Connection: close 模式下忽略后续数据
     })
 
     clientSocket.on('error', (error) => {
@@ -326,13 +379,42 @@ export class MitmProxy {
   }
 
   /**
+   * 去掉 Connection / Proxy-Connection / Keep-Alive 头并追加 Connection: close
+   */
+  private forceConnectionClose(headers: string): string {
+    const lines = headers.split('\r\n').filter((line, idx) => {
+      if (idx === 0) return true
+      return !/^(connection|proxy-connection|keep-alive)\s*:/i.test(line)
+    })
+    lines.push('Connection: close')
+    return lines.join('\r\n')
+  }
+
+  /**
+   * 设置（替换或追加）请求头
+   */
+  private setHeader(headers: string, name: string, value: string): string {
+    const re = new RegExp(`^${name}\\s*:.*$`, 'im')
+    if (re.test(headers)) {
+      return headers.replace(re, `${name}: ${value}`)
+    }
+    return `${headers}\r\n${name}: ${value}`
+  }
+
+  /**
    * 替换请求体中的 Machine ID
    */
-  private modifyBody(body: string): string {
+  private modifyBody(bodyBuf: Buffer): Buffer {
     const targetDeviceId = this.config.deviceId
-    if (!targetDeviceId || !body) return body
+    if (!targetDeviceId || bodyBuf.length === 0) return bodyBuf
+    // 按 latin1 处理：字节一一对应，十六进制 ID 为 ASCII，替换不会破坏其他字节
+    const body = bodyBuf.toString('latin1')
     // 只在 body 中包含 64 位十六进制时才替换（避免误伤无关内容）
-    if (!MACHINE_ID_REGEX.test(body)) return body
+    MACHINE_ID_REGEX.lastIndex = 0
+    if (!MACHINE_ID_REGEX.test(body)) {
+      MACHINE_ID_REGEX.lastIndex = 0
+      return bodyBuf
+    }
     MACHINE_ID_REGEX.lastIndex = 0
     const result = body.replace(MACHINE_ID_REGEX, (match) => {
       // 不替换已经是目标 ID 的
@@ -343,7 +425,7 @@ export class MitmProxy {
       return targetDeviceId
     })
     MACHINE_ID_REGEX.lastIndex = 0
-    return result
+    return result === body ? bodyBuf : Buffer.from(result, 'latin1')
   }
 
   /**
@@ -415,16 +497,16 @@ export class MitmProxy {
 
   /**
    * 转发请求到目标服务器
+   * streaming=true 时返回的写入函数用于继续转发后续请求体分片（chunked 等）
    */
   private forwardRequest(
     headers: string,
-    initialBody: string,
+    initialBody: Buffer,
     hostname: string,
     port: number,
     clientSocket: tls.TLSSocket,
-    contentLength: number,
-    bodyReceived: number
-  ): void {
+    streaming: boolean
+  ): (chunk: Buffer) => void {
     const startTime = Date.now()
 
     // 握手完成前到达的 body 分片要先缓存，否则会被丢弃导致上游收到不完整请求体。
@@ -439,68 +521,73 @@ export class MitmProxy {
       rejectUnauthorized: true
     }, () => {
       connected = true
-      // 发送修改后的请求头
-      serverSocket.write(headers + '\r\n\r\n')
+      // 发送修改后的请求头（latin1 保持原始字节）
+      serverSocket.write(Buffer.from(headers + '\r\n\r\n', 'latin1'))
       // 发送已接收的请求体
-      if (initialBody) {
+      if (initialBody.length > 0) {
         serverSocket.write(initialBody)
       }
       // 冲刷握手期间缓存的 body 分片
       for (const chunk of pending) serverSocket.write(chunk)
       pending.length = 0
     })
-
-    // 接管客户端后续 body 分片：连接好直接转发，否则先缓存（'data' 为异步事件，此时 serverSocket 已就绪）
-    const onClientBody = (chunk: Buffer): void => {
-      bodyReceived += chunk.length
-      if (connected) serverSocket.write(chunk)
-      else pending.push(chunk)
-    }
-    // 仅当还有未收齐的 body 时才需要继续接管后续分片
-    if (bodyReceived < contentLength) {
-      clientSocket.on('data', onClientBody)
-    }
+    // 跟踪上游连接，stop() 时一并销毁
+    this.sockets.add(serverSocket)
 
     let settled = false
-    const cleanup = (): void => {
-      clientSocket.removeListener('data', onClientBody)
+    const writeBody = (chunk: Buffer): void => {
+      if (!streaming || serverSocket.destroyed) return
+      if (connected) serverSocket.write(chunk)
+      else pending.push(chunk)
     }
 
     // 将响应转发回客户端
     serverSocket.on('data', (chunk: Buffer) => {
-      clientSocket.write(chunk)
+      if (!clientSocket.destroyed) clientSocket.write(chunk)
     })
 
     serverSocket.on('end', () => {
-      if (settled) return
-      settled = true
-      cleanup()
-      const duration = Date.now() - startTime
-      this.events.onResponse?.({
-        timestamp: Date.now(),
-        host: hostname,
-        statusCode: 200,
-        duration
-      })
+      if (!settled) {
+        settled = true
+        const duration = Date.now() - startTime
+        this.events.onResponse?.({
+          timestamp: Date.now(),
+          host: hostname,
+          statusCode: 200,
+          duration
+        })
+      }
       clientSocket.end()
     })
 
     serverSocket.on('error', (error) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      console.error(`[MitmProxy] Server connection error to ${hostname}:`, error.message)
+      if (!settled) {
+        settled = true
+        console.error(`[MitmProxy] Server connection error to ${hostname}:`, error.message)
+      }
       clientSocket.end()
     })
 
-    clientSocket.on('end', () => {
-      serverSocket.end()
+    serverSocket.once('close', () => {
+      this.sockets.delete(serverSocket)
+      // 上游关闭（Connection: close）后关闭客户端，客户端下个请求会重新建连
+      if (!clientSocket.destroyed) clientSocket.end()
     })
 
-    clientSocket.on('error', () => {
-      cleanup()
+    clientSocket.on('end', () => {
+      // 流式模式下客户端半关闭表示请求体结束；非流式模式请求已完整发出，等待上游响应即可
+      if (streaming) serverSocket.end()
+    })
+
+    // 客户端异常或被销毁（含 stop()）时释放上游连接
+    clientSocket.once('error', () => {
       serverSocket.destroy()
     })
+    clientSocket.once('close', () => {
+      serverSocket.destroy()
+    })
+
+    return writeBody
   }
 
   /**

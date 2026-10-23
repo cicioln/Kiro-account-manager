@@ -119,7 +119,9 @@ export class CertManager {
 
     // 保存到文件
     fs.writeFileSync(certPath, certPem)
-    fs.writeFileSync(keyPath, keyPem)
+    // CA 私钥仅限当前用户读写（mode 仅在新建文件时生效，已存在时再 chmod 一次）
+    fs.writeFileSync(keyPath, keyPem, { mode: 0o600 })
+    try { fs.chmodSync(keyPath, 0o600) } catch { /* Windows 等平台忽略 */ }
 
     this.caCert = cert
     this.caKey = keys.privateKey

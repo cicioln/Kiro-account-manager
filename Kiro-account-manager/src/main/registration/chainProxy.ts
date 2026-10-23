@@ -135,8 +135,18 @@ export class ChainProxyRelay {
       }
       const host = m[1]
       const port = Number(m[2])
+      // 拨号期间客户端可能已放弃（超时关闭），需在隧道建立后检查，避免隧道泄漏
+      let clientClosed = false
+      client.once('close', () => { clientClosed = true })
       this.dialChain(host, port)
         .then((tunnel) => {
+          // 隧道纳入跟踪，stop() 时一并销毁
+          this.sockets.add(tunnel)
+          tunnel.once('close', () => this.sockets.delete(tunnel))
+          if (clientClosed || client.destroyed || !this.server) {
+            tunnel.destroy()
+            return
+          }
           client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
           client.pipe(tunnel)
           tunnel.pipe(client)
@@ -154,14 +164,24 @@ export class ChainProxyRelay {
   /** 经上游中转连到目标代理入口，再在该连接上对目标代理做 CONNECT 抵达最终目标 */
   private async dialChain(host: string, port: number): Promise<net.Socket> {
     const sock = await this.connectViaUpstream(this.target.host, this.target.port)
+    let timer: NodeJS.Timeout | null = null
     try {
-      const resp = await this.sendConnectRequest(sock, host, port, this.target)
+      // 目标代理迟迟不回应 CONNECT 时超时销毁，避免上游 socket 无限挂起
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          sock.destroy()
+          reject(new Error('目标代理 CONNECT 响应超时'))
+        }, 20000)
+      })
+      const resp = await Promise.race([this.sendConnectRequest(sock, host, port, this.target), timeout])
       if (resp.status !== 200) {
         throw new Error(this.formatConnectError('目标代理', resp))
       }
     } catch (err) {
       sock.destroy()
       throw err
+    } finally {
+      if (timer) clearTimeout(timer)
     }
     return sock
   }

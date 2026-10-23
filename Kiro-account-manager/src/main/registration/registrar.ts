@@ -102,6 +102,8 @@ export class Registrar {
   private log: LogFn
   private onStep: StepFn2
   private abortController = new AbortController()
+  /** cleanup() 后置为 true：被超时看门狗遗弃的后台步骤不得再新建代理链 / TLS session */
+  private disposed = false
   private chainRelay: ChainProxyRelay | null = null
   private chainTargetProxy = ''
   private exitIP = ''
@@ -145,9 +147,17 @@ export class Registrar {
     const target = (this.cfg.proxy || '').trim()
     const upstream = (this.cfg.upstreamProxy || '').trim()
     if (!target || !upstream) return
+    if (this.disposed) return
     try {
-      this.chainRelay = new ChainProxyRelay(upstream, target, (m) => this.log(m))
-      const relayUrl = await this.chainRelay.start()
+      const relay = new ChainProxyRelay(upstream, target, (m) => this.log(m))
+      this.chainRelay = relay
+      const relayUrl = await relay.start()
+      if (this.disposed) {
+        // 启动期间已被 cleanup：立即停掉，避免泄漏监听端口
+        try { await relay.stop() } catch { /* ignore */ }
+        if (this.chainRelay === relay) this.chainRelay = null
+        return
+      }
       this.chainTargetProxy = target
       this.cfg.proxy = relayUrl
       this.log('[ProxyChain] 已启用代理链：本机 → 上游中转 → 目标代理 → 目标站点')
@@ -218,7 +228,7 @@ export class Registrar {
   private async refreshProxySession(): Promise<void> {
     // 还原到原始目标代理 URL（代理链会把 cfg.proxy 替换为本地中继地址）
     const original = this.chainTargetProxy || this.cfg.proxy || ''
-    if (!original) return
+    if (!original || this.disposed) return
 
     // 替换或追加 _session-随机值
     const session = Array.from({ length: 8 }, () =>
@@ -290,12 +300,15 @@ export class Registrar {
    *   4. GitHub 下载到 userData（最后兜底，仅首次）
    */
   private async initTlsClient(): Promise<void> {
+    if (this.disposed) return
     const { existingPath, downloadDir } = this.ensureTlsLib()
     const opts = existingPath
       ? { customLibraryPath: existingPath }
       : { customLibraryDownloadPath: downloadDir }
     // 共享池：首次注册才真正 open(DLL+worker pool)，之后所有注册秒级复用
-    this.moduleClient = await acquireModuleClient(opts)
+    const moduleClient = await acquireModuleClient(opts)
+    if (this.disposed) return
+    this.moduleClient = moduleClient
     this.log('[TLS] using shared ModuleClient, pool stats: ' + JSON.stringify(this.moduleClient.getPoolStats()))
     this.session = new SessionClient(this.moduleClient, this.sessionOpts)
   }
@@ -371,7 +384,9 @@ export class Registrar {
   private async rebuildTlsClient(): Promise<void> {
     // 只重建轻量级的 SessionClient（新 TLS 连接），复用重量级的 ModuleClient（worker pool + DLL）
     // 之前的实现会 terminate + 重新 open ModuleClient，导致每次注册创建 2 个 worker pool
+    if (this.disposed) return
     try { await this.session?.destroySession() } catch { /* ignore */ }
+    if (this.disposed) return
     if (!this.moduleClient) {
       await this.initTlsClient()
       return
@@ -407,6 +422,10 @@ export class Registrar {
 
   /** 清理 TLS 客户端资源：仅销毁 SessionClient；ModuleClient 是进程级共享池，不再每次 terminate */
   private async cleanup(): Promise<void> {
+    // 先中止所有进行中的异步操作：被 withTimeout 遗弃的步骤仍在后台跑，
+    // 若不中止会在 cleanup 之后重建代理链 / SessionClient，造成泄漏
+    this.disposed = true
+    this.abortController.abort()
     if (this.chainRelay) {
       try { await this.chainRelay.stop() } catch { /* ignore */ }
       this.chainRelay = null
@@ -534,6 +553,8 @@ export class Registrar {
     let lastErr: unknown = null
     let sessionRefreshed = false // 整个请求最多换 1 次 proxy session，避免频繁停建代理链
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.checkAborted()
+      if (!this.session) throw new Error('TLS 客户端已释放')
       try {
         const resp = method === 'GET'
           ? await this.session!.get(url, { headers })
@@ -541,6 +562,7 @@ export class Registrar {
         const decoded = this.decodeBody(resp.body)
         const status = resp.status
         if (attempt < maxAttempts && this.isTransientResponse(status, decoded)) {
+          this.checkAborted()
           const broken = status === 0 || /eof|reset|failed to do request/i.test(decoded)
           // 超时类（出口 IP 慢/被限/隧道挂起）：重建 TLS 同 IP 无用，换 proxy session 切换出口 IP
           if (this.isTimeoutResponse(status, decoded) && !sessionRefreshed && this.canRefreshProxySession()) {
@@ -564,6 +586,7 @@ export class Registrar {
       } catch (err: unknown) {
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
+          this.checkAborted()
           this.log(`[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
           await this.rebuildTlsClient()
           await this.abortableSleep(this.netBackoffMs(attempt))
