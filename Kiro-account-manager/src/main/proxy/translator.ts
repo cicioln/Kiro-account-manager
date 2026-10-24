@@ -1118,7 +1118,8 @@ export function claudeToKiro(
   const additionalModelRequestFields = buildThinkingFields(
     thinkingConfig,
     request.thinking as { type: string; budget_tokens?: number; display?: string },
-    undefined
+    // Claude Code 通过 output_config.effort 传思考强度（/effort 设置），此前传 undefined 被忽略、总用默认档
+    request.output_config?.effort
   )
 
   return buildKiroPayload(
@@ -1187,6 +1188,9 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
           for (const b of block.content) {
             if (b.type === 'text') {
               textParts.push(b.text || '')
+            } else if (b.type === 'tool_reference' && b.tool_name) {
+              // ToolSearch 返回的延迟加载工具引用；Kiro 不认识该块，转成文本让模型知道工具已可用
+              textParts.push(`Tool loaded: ${b.tool_name}\n`)
             } else if (b.type === 'image' && b.source?.type === 'base64' && b.source.data) {
               const mediaTypeParts = (b.source.media_type || '').split('/')
               const imageFormat = mediaTypeParts[1]

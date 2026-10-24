@@ -192,7 +192,9 @@ export interface ClaudeSystemBlock {
 }
 
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking'
+  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking' | 'tool_reference'
+  /** tool_reference 块（ToolSearch 结果）引用的工具名 */
+  tool_name?: string
   text?: string
   thinking?: string
   signature?: string
