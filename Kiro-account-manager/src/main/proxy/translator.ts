@@ -758,12 +758,62 @@ function convertOpenAITools(
       toolSpecification: {
         name: shortenToolName(tool.function.name, toolNameRegistry),
         description,
-        inputSchema: { json: tool.function.parameters }
+        inputSchema: { json: normalizeToolSchema(tool.function.parameters) }
       }
     }
     const cachePoint = toKiroCachePoint(tool.cache_control)
     return cachePoint ? [kiroTool, { cachePoint }] : [kiroTool]
   })
+}
+
+// Kiro/Bedrock 工具 schema 规则：顶层必须是 type: object，且不允许 oneOf/anyOf/allOf
+// （TOOL_SCHEMA_INVALID）。MCP 工具（如用 zod union 定义参数）常在顶层用这些组合关键字，
+// 这里把顶层组合展开为单个 object：合并各分支 properties；required 对 allOf 取并集，
+// 对 anyOf/oneOf 取交集（只有所有分支都必填的字段才必填，避免模型被迫填不相关的分支字段）。
+// 嵌套层级的组合关键字 Kiro 允许，保持原样。
+function normalizeToolSchema(schema: unknown): Record<string, unknown> {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    return { type: 'object', properties: {} }
+  }
+  const src = schema as Record<string, unknown>
+  const combinerKey = (['allOf', 'anyOf', 'oneOf'] as const).find(k => Array.isArray(src[k]))
+  if (!combinerKey) {
+    return src.type === 'object' || src.type === undefined
+      ? { ...src, type: 'object', properties: src.properties ?? {} }
+      : { type: 'object', properties: {} }
+  }
+
+  const { allOf: _a, anyOf: _b, oneOf: _c, ...rest } = src
+  const properties: Record<string, unknown> = { ...((rest.properties as Record<string, unknown>) || {}) }
+  const baseRequired = Array.isArray(rest.required) ? (rest.required as string[]) : []
+  const branchRequired: string[][] = []
+  const descriptions: string[] = []
+
+  for (const branch of src[combinerKey] as unknown[]) {
+    // 分支本身可能也是组合（如 allOf 里嵌 anyOf），递归展开
+    const b = normalizeToolSchema(branch)
+    Object.assign(properties, (b.properties as Record<string, unknown>) || {})
+    branchRequired.push(Array.isArray(b.required) ? (b.required as string[]) : [])
+    if (typeof b.description === 'string') descriptions.push(b.description)
+  }
+
+  let required: string[]
+  if (combinerKey === 'allOf') {
+    required = [...new Set([...baseRequired, ...branchRequired.flat()])]
+  } else {
+    const common = branchRequired.length > 0
+      ? branchRequired.reduce((acc, r) => acc.filter(k => r.includes(k)))
+      : []
+    required = [...new Set([...baseRequired, ...common])]
+  }
+
+  const result: Record<string, unknown> = { ...rest, type: 'object', properties }
+  delete result.required
+  if (required.length > 0) result.required = required.filter(k => k in properties)
+  if (!result.description && descriptions.length > 0 && combinerKey !== 'allOf') {
+    result.description = `One of: ${descriptions.join(' | ')}`
+  }
+  return result
 }
 
 function shortenToolName(name: string, toolNameRegistry: ToolNameRegistry): string {
@@ -1262,7 +1312,7 @@ function convertClaudeTools(
       toolSpecification: {
         name: shortenToolName(tool.name, toolNameRegistry),
         description,
-        inputSchema: { json: tool.input_schema }
+        inputSchema: { json: normalizeToolSchema(tool.input_schema) }
       }
     }
     const cachePoint = toKiroCachePoint(tool.cache_control)
