@@ -718,6 +718,11 @@ export class ProxyServer {
   }
 
   private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
+    return this.downloadDataUrl(url, ['image/jpeg', 'image/png', 'image/gif', 'image/webp'], 'image', signal)
+  }
+
+  private async downloadDataUrl(url: string, allowedTypes: string[], kind: 'image' | 'document', signal?: AbortSignal, fallbackType?: string): Promise<string> {
+    if (!/^https?:\/\//i.test(url)) throw new Error(`Unsupported ${kind} URL: only http(s) is allowed`)
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
     const abort = () => controller.abort(this.getAbortError(signal))
@@ -736,15 +741,18 @@ export class ProxyServer {
         ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
         : await fetch(url, { signal: controller.signal })
       if (!response.ok) {
-        throw new Error(`Failed to download image: HTTP ${response.status}`)
+        throw new Error(`Failed to download ${kind}: HTTP ${response.status}`)
       }
-      const contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
-      if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
-        throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
+      let contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
+      // 不少站点给 PDF 返回 application/octet-stream，按 URL 扩展名兜底
+      if ((!contentType || contentType === 'application/octet-stream') && fallbackType) contentType = fallbackType
+      const allowed = !!contentType && (allowedTypes.includes(contentType) || (kind === 'document' && contentType.startsWith('text/')))
+      if (!allowed) {
+        throw new Error(`Unsupported ${kind} content-type: ${contentType || 'unknown'}`)
       }
       const arrayBuffer = await response.arrayBuffer()
       if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
-        throw new Error('Image exceeds 10MB limit')
+        throw new Error(`${kind === 'image' ? 'Image' : 'Document'} exceeds 10MB limit`)
       }
       return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
     } finally {
@@ -764,18 +772,34 @@ export class ProxyServer {
     return request
   }
 
+  // 把 URL 形式的 image / document（含 tool_result 内嵌的）下载为 base64：Kiro 只接受内联字节，
+  // 不处理会在转换时报 "Unsupported document source type: url"
   private async resolveClaudeHttpImages(request: ClaudeRequest, signal?: AbortSignal): Promise<ClaudeRequest> {
+    const resolveBlock = async (block: ClaudeContentBlock): Promise<void> => {
+      if (block.type === 'tool_result' && Array.isArray(block.content)) {
+        await Promise.all(block.content.map(resolveBlock))
+        return
+      }
+      if ((block.type !== 'image' && block.type !== 'document') || block.source?.type !== 'url') return
+      const url = (block.source as { url: string }).url
+      const dataUrl = block.type === 'image'
+        ? await this.downloadImageDataUrl(url, signal)
+        : await this.downloadDataUrl(url, ['application/pdf'], 'document', signal,
+          /\.pdf(?:$|[?#])/i.test(url) ? 'application/pdf' : undefined)
+      const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+      if (!match) {
+        throw new Error(`Downloaded ${block.type} produced invalid data URL`)
+      }
+      // 文档没有 title 时用 URL 文件名，便于模型区分多个文档
+      if (block.type === 'document' && !block.title && !block.name) {
+        const fileName = decodeURIComponent(url.split(/[?#]/)[0].split('/').pop() || '')
+        if (fileName) block.title = fileName
+      }
+      block.source = { type: 'base64', media_type: match[1], data: match[2] }
+    }
     await Promise.all(request.messages.map(async message => {
       if (!Array.isArray(message.content)) return
-      await Promise.all(message.content.map(async block => {
-        if (block.type !== 'image' || block.source?.type !== 'url') return
-        const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
-        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
-        if (!match) {
-          throw new Error('Downloaded image produced invalid data URL')
-        }
-        block.source = { type: 'base64', media_type: match[1], data: match[2] }
-      }))
+      await Promise.all(message.content.map(resolveBlock))
     }))
     return request
   }

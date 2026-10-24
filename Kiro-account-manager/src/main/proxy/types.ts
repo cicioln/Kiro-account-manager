@@ -215,6 +215,8 @@ export type ClaudeDocumentSource =
   | { type: 'base64'; media_type: string; data: string }
   | { type: 'text'; media_type?: string; data: string }
   | { type: 'content'; content: string | Array<{ type: string; text?: string }> }
+  /** URL 文档：proxyServer 在转换前下载为 base64（Kiro 不接受 URL） */
+  | { type: 'url'; url: string }
 
 export interface ClaudeTool {
   name: string
