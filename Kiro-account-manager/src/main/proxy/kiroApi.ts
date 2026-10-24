@@ -1528,11 +1528,10 @@ async function parseEventStream(
   const streamEventCounts: Record<string, number> = {}
   
   // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
-  // 这里只是兜底初值，后续真实事件会覆盖
-  if (payloadStr) {
-    // 用 tiktoken cl100k_base 精确计算（±5%）
-    usage.inputTokens = countTokens(payloadStr)
-  } else if (inputChars > 0) {
+  // 这里只是兜底初值：先用字符系数，tiktoken 推迟到流结束且没收到真实/反推值时才算。
+  // 旧实现在首字节前同步 tiktoken 整个 payload（常见 0.3-1MB），几乎每次都被 contextUsageEvent 覆盖，
+  // 却要阻塞事件循环数百毫秒到数秒，拖慢所有并发请求
+  if (inputChars > 0) {
     // 字符系数兜底（针对 payload JSON 经验值 0.42）
     usage.inputTokens = Math.max(1, Math.round(inputChars * 0.42))
   }
@@ -2070,7 +2069,9 @@ async function parseEventStream(
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
-                proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
+                // 逐片段日志受 logStreamEvents 控制：thinking 每个 token 片段一条，默认全记会把日志池
+                // 刷满（5 万条仅覆盖约 40 分钟），并在每个片段上付出写日志开销
+                if (logStreamEvents) proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
                 await onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
                 usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
@@ -2082,7 +2083,7 @@ async function parseEventStream(
                 proxyLogger.info('Kiro', `Received redacted thinking content (len=${reasoning.redactedContent.length})`)
                 await onChunk('', undefined, true, undefined, reasoning.redactedContent)
               }
-              proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
+              if (logStreamEvents) proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
             }
             
             // 处理 codeReferenceEvent - 代码引用/许可证信息
@@ -2249,6 +2250,11 @@ async function parseEventStream(
       proxyLogger.debug('Kiro', `Stream events summary (${total} total)`, streamEventCounts)
     }
     
+    // 既无真实 tokenUsage 也无 contextUsage 反推时，才用 tiktoken 精确计算输入（见初始化处说明）
+    if (!hasRealTokenUsage && !usage.contextUsage && payloadStr) {
+      usage.inputTokens = countTokens(payloadStr)
+    }
+
     throwIfAborted(signal)
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     // await 并让异常走 onError：调用方的 onComplete 是 async，旧实现不 await，内部抛错会变成

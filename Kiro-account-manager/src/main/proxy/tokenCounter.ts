@@ -26,12 +26,30 @@ function getEncoder(): Tiktoken | null {
  * 使用 tiktoken cl100k_base 精确计算 token 数。
  * 兜底：UTF-8 字节数 / 3.0（针对 payload JSON 经验值，误差 ±10%）。
  */
+// js-tiktoken 的 BPE 对「无空白的超长片段」是平方级复杂度：实测 8000 个 '-' 要 3.7s、5 万个 'a'
+// 要 160s。encode 同步执行会冻结主进程事件循环，所有并发流（含 SSE 心跳）一起卡住。
+// 超长连续片段（minified 代码、分隔线、base64 等）改用字节估算，其余正常 tiktoken。
+const LONG_RUN_RE = /\S{256,}/g
+const MAX_TIKTOKEN_CHARS = 2_000_000
+
+/** 快速估算（无 tiktoken），用于只需近似值的场景（prompt cache 模拟等） */
+export function estimateTokensFast(text: string): number {
+  if (!text) return 0
+  return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.5)
+}
+
 export function countTokens(text: string): number {
   if (!text) return 0
+  if (text.length > MAX_TIKTOKEN_CHARS) return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
   const enc = getEncoder()
   if (enc) {
     try {
-      return enc.encode(text).length
+      let estimated = 0
+      const safe = text.replace(LONG_RUN_RE, (run) => {
+        estimated += Math.ceil(Buffer.byteLength(run, 'utf-8') / 3.0)
+        return ' '
+      })
+      return enc.encode(safe).length + estimated
     } catch (err) {
       console.warn('[TokenCounter] encode failed, using fallback:', err)
     }

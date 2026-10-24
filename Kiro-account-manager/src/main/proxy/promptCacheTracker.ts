@@ -3,7 +3,9 @@
 // 让 Claude Code 的 cache_control 字段产生实际效果的 usage 统计
 
 import { createHash } from 'crypto'
-import { estimateTokens } from './kiroApi'
+// 模拟缓存只需近似 token 数：逐块 tiktoken 在首字节前同步执行，1MB 请求要 1s 以上、病态内容更久，
+// 阻塞事件循环拖慢所有并发流，这里用字节估算
+import { estimateTokensFast as estimateTokens } from './tokenCounter'
 
 // 常量
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000       // 5 分钟（Anthropic 默认 ephemeral TTL）

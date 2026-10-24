@@ -314,9 +314,10 @@ class ProxyLogStore {
   add(entry: LogEntry): void {
     this.logs.push(entry)
 
-    // 超过最大数量时删除最旧的
+    // 超过上限时批量裁掉最旧的 10%：旧实现每条都 slice 复制整个 5 万条数组（约 0.5ms/条），
+    // 日志池满后每个流式片段都要付这笔开销
     if (this.logs.length > this.maxLogs) {
-      this.logs = this.logs.slice(-this.maxLogs)
+      this.logs.splice(0, this.logs.length - Math.floor(this.maxLogs * 0.9))
     }
 
     // 通知监听器（异常隔离）
