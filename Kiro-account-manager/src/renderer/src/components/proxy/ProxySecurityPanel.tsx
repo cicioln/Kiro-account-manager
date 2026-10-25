@@ -19,6 +19,7 @@ interface ProxyConfigSecurity {
   enableMetrics?: boolean
   fallbackPort?: number
   enableAuditLog?: boolean
+  logUserPrompts?: boolean
   tls?: { enabled?: boolean; cert?: string; key?: string; certPath?: string; keyPath?: string }
 }
 
@@ -317,6 +318,28 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
                 className="h-9"
               />
               <p className="text-xs text-muted-foreground mt-1">{isEn ? 'Default 100, max 10000' : '默认 100，上限 10000'}</p>
+            </div>
+          </div>
+
+          {/* 用户提示词日志 */}
+          <div className="flex items-center justify-between p-3 rounded-md border bg-background/50">
+            <div>
+              <Label className="text-sm">{isEn ? 'Log user prompts' : '记录用户提示词'}</Label>
+              <p className="text-xs text-muted-foreground mt-1">
+                {isEn
+                  ? 'Save each user\'s latest input (per API key) to logs/prompts/*.jsonl, kept 30 days'
+                  : '按 API Key 记录每次用户输入的提示词到 logs/prompts/*.jsonl，保留 30 天'}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={config.logUserPrompts || false}
+                onCheckedChange={(checked) => updateConfig('logUserPrompts', checked)}
+              />
+              <Button variant="outline" size="sm" onClick={() => void window.api.proxyOpenPromptLogs()}>
+                <FileText className="h-3 w-3 mr-1" />
+                {isEn ? 'Open' : '打开'}
+              </Button>
             </div>
           </div>
 

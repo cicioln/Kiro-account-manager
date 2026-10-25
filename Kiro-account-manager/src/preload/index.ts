@@ -652,6 +652,11 @@ const api = {
     return ipcRenderer.invoke('proxy-update-config', config)
   },
 
+  /** 打开用户提示词日志目录 */
+  proxyOpenPromptLogs: (): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-open-prompt-logs')
+  },
+
   // ============ v1.8 反代安全 / 可观测 IPC ============
 
   /** 获取反代自签证书信息（用于在 UI 显示指纹/有效期 + 让用户导出 .crt） */

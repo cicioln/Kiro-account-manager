@@ -572,6 +572,8 @@ export interface ProxyConfig {
   fallbackPort?: number
   /** 启用审计日志（管理 API 操作、config 变更） */
   enableAuditLog?: boolean
+  /** 记录每个用户本轮输入的提示词到 <userData>/logs/prompts/prompts-YYYY-MM-DD.jsonl */
+  logUserPrompts?: boolean
 
   // ============ Agent 模式 + Steering（v1.7.5 新增） ============
   /** Agent 模式：vibe（对话优先）或 spec（计划优先）。默认 vibe */

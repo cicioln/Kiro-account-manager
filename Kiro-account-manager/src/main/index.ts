@@ -1,4 +1,5 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, net } from 'electron'
+import { promptLogger } from './proxy/promptLogger'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join, resolve, dirname } from 'path'
@@ -6416,6 +6417,16 @@ app.whenReady().then(async () => {
     } catch (error) {
       console.error('[ProxyServer] Update config failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to update config' }
+    }
+  })
+
+  // 打开用户提示词日志目录
+  ipcMain.handle('proxy-open-prompt-logs', async () => {
+    try {
+      const err = await shell.openPath(promptLogger.getLogDir())
+      return err ? { success: false, error: err } : { success: true }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
     }
   })
 

@@ -632,6 +632,8 @@ interface KiroApi {
   // 更新反代服务器配置
   proxyUpdateConfig: (config: Record<string, unknown>) => Promise<{ success: boolean; config?: unknown; error?: string }>
 
+  proxyOpenPromptLogs: () => Promise<{ success: boolean; error?: string }>
+
   // ============ v1.8 反代安全 / 可观测 IPC ============
   proxySelfSignedCertInfo: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
   proxySelfSignedCertRegenerate: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>

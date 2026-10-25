@@ -35,6 +35,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { promptLogger, extractLatestUserPrompt } from './promptLogger'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
 // SSE 心跳间隔：需明显小于 Cloudflare 等反代的空闲断开阈值（~100-120s）
@@ -1813,6 +1814,33 @@ export class ProxyServer {
     return req.socket.remoteAddress || ''
   }
 
+  /** 开启 logUserPrompts 时记录本轮用户输入的提示词（只取最后一条 user 消息的文本） */
+  private logUserPrompt(
+    req: http.IncomingMessage,
+    path: string,
+    model: string | undefined,
+    messages: Array<{ role?: string; content?: unknown }> | undefined,
+    apiKey: import('./types').ApiKey | undefined,
+    sessionId?: string
+  ): void {
+    if (!this.config.logUserPrompts) return
+    try {
+      const prompt = extractLatestUserPrompt(messages)
+      if (!prompt) return
+      promptLogger.log({
+        path,
+        model,
+        apiKeyId: apiKey?.id,
+        apiKeyName: apiKey?.name,
+        clientIP: this.getClientIP(req),
+        sessionId,
+        prompt
+      })
+    } catch (error) {
+      proxyLogger.warn('ProxyServer', 'Failed to log user prompt', error)
+    }
+  }
+
   // 记录 API Key 用量
   recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string): void {
     if (!this.config.apiKeys) return
@@ -2212,7 +2240,7 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -2480,6 +2508,7 @@ export class ProxyServer {
       top_p: geminiReq.generationConfig?.topP,
       max_tokens: geminiReq.generationConfig?.maxOutputTokens
     }
+    this.logUserPrompt(req, path, openaiRequest.model, openaiRequest.messages, matchedApiKey)
 
     // 复用 OpenAI 流程
     const startTime = Date.now()
@@ -2781,6 +2810,7 @@ export class ProxyServer {
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
+    this.logUserPrompt(req, '/v1/chat/completions', request.model, request.messages, matchedApiKey, rawHintChat)
 
     const startTime = Date.now()
 
@@ -2919,6 +2949,7 @@ export class ProxyServer {
         affinityHintResp = `${keyPrefix}:${rawHintResp}`
       }
       chatRequest.model = this.applyModelMapping(chatRequest.model, matchedApiKey?.id)
+      this.logUserPrompt(req, '/v1/responses', chatRequest.model, chatRequest.messages, matchedApiKey, rawHintResp)
       processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest), signal)
     } catch (error) {
       if (this.isAbortError(error, signal)) return
@@ -3236,6 +3267,7 @@ export class ProxyServer {
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
+    this.logUserPrompt(req, '/v1/messages', request.model, request.messages, matchedApiKey, rawHint)
 
     const startTime = Date.now()
 
