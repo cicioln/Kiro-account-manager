@@ -625,7 +625,7 @@ function parseImageUrl(url: string): KiroImage | null {
     const match = url.match(/^data:image\/(\w+);base64,(.+)$/)
     if (match) {
       return {
-        format: normalizeImageFormat(match[1]),
+        format: resolveImageFormat(match[1], match[2]),
         source: { bytes: match[2] }
       }
     }
@@ -721,6 +721,32 @@ function normalizeImageFormat(format: string): string {
     throw new Error(`Unsupported image format: ${format}`)
   }
   return normalized
+}
+
+// 按文件头魔数识别真实图片格式。客户端声明的 media_type 常与实际字节不符（如剪贴板 webp 标成 png），
+// Kiro 会直接回 IMAGE_FORMAT_UNSUPPORTED；以字节为准纠正，识别不了时回落到声明值
+function sniffImageFormat(base64: string): string | undefined {
+  let head: Buffer
+  try {
+    head = Buffer.from(base64.slice(0, 24), 'base64')
+  } catch {
+    return undefined
+  }
+  if (head.length >= 4 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return 'png'
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'jpeg'
+  if (head.length >= 4 && head.toString('ascii', 0, 4) === 'GIF8') return 'gif'
+  if (head.length >= 12 && head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WEBP') return 'webp'
+  if (head.length >= 2 && head[0] === 0x42 && head[1] === 0x4d) return 'bmp'
+  if (head.length >= 12 && head.toString('ascii', 4, 8) === 'ftyp') return 'heic/avif'
+  const text = head.toString('utf8').trimStart()
+  if (text.startsWith('<svg') || text.startsWith('<?xml')) return 'svg'
+  return undefined
+}
+
+function resolveImageFormat(declared: string, base64: string): string {
+  const sniffed = sniffImageFormat(base64)
+  // sniffed 为 bmp/svg 等时 normalizeImageFormat 会抛出明确错误，本地返回 400，不再白跑上游两个端点
+  return normalizeImageFormat(sniffed || declared)
 }
 
 function normalizeDocumentFormat(mediaType: string | undefined, name: string): string {
@@ -1167,7 +1193,7 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
           throw new Error(`Unsupported image media_type: ${block.source.media_type}`)
         }
         images.push({
-          format: normalizeImageFormat(imageFormat),
+          format: resolveImageFormat(imageFormat, block.source.data),
           source: { bytes: block.source.data }
         })
       } else if (block.type === 'document' && block.source) {
@@ -1197,7 +1223,7 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
               if (mediaTypeParts[0] === 'image' && imageFormat) {
                 try {
                   images.push({
-                    format: normalizeImageFormat(imageFormat),
+                    format: resolveImageFormat(imageFormat, b.source.data),
                     source: { bytes: b.source.data }
                   })
                   extractedImageCount++

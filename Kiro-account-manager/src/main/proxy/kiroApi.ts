@@ -1358,8 +1358,9 @@ export async function callKiroApiStream(
       lastError = error as Error
       console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
       
-      // 如果是认证错误，不继续尝试其他端点
-      if ((error as Error).message.includes('Auth error')) {
+      // 如果是认证错误，或请求内容本身无效（换端点结果一样），不继续尝试其他端点
+      if ((error as Error).message.includes('Auth error')
+        || /IMAGE_FORMAT_UNSUPPORTED|TOOL_SCHEMA_INVALID|INVALID_DOCUMENT/.test((error as Error).message)) {
         onError(error as Error)
         return
       }
