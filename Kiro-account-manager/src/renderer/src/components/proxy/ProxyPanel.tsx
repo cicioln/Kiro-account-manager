@@ -76,6 +76,11 @@ interface ProxyConfig {
   clientDrivenToolExecution?: boolean
   disableTools?: boolean
   payloadSizeLimitKB?: number
+  cacheSimEnabled?: boolean
+  cacheSimTargetRatio?: number
+  cacheSimCreditCostUsd?: number
+  cacheSimProfitMargin?: number
+  cacheSimPriceMultiplier?: number
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
   autoSwitchOnQuotaExhausted?: boolean
@@ -1121,6 +1126,51 @@ export function ProxyPanel() {
                     placeholder={isEn ? 'e.g. C:/Projects/my-app (optional)' : '如 C:/Projects/my-app（可选）'}
                     className="h-9"
                   />
+                </div>
+              </div>
+              {/* 缓存模拟：会话平滑命中率 + 积分成本兜底 */}
+              <div className="col-span-3 space-y-1.5">
+                <Label className="text-xs" title={isEn ? 'Split returned usage into cache_read / cache_creation / input so each session averages the target hit rate. If downstream revenue (official price × multiplier) would fall below credits × cost × (1 + margin), cache_read is lowered for that request.' : '按目标命中率拆分返回的 usage（cache_read / cache_creation / input），每个会话长期平均趋近目标值。若下游收费（官方价 × 倍率）低于 积分 × 每积分成本 × (1 + 盈利率)，该次请求自动降低 cache_read。'}>{isEn ? 'Cache Simulation' : '缓存模拟'}</Label>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[160px] flex-shrink-0">
+                    <span className="text-xs text-muted-foreground">{isEn ? 'Enable' : '启用'}</span>
+                    <Switch
+                      checked={config.cacheSimEnabled || false}
+                      onCheckedChange={(checked) => {
+                        setConfig(prev => ({ ...prev, cacheSimEnabled: checked }))
+                        window.api.proxyUpdateConfig({ cacheSimEnabled: checked })
+                      }}
+                      className="scale-90"
+                    />
+                  </div>
+                  {([
+                    { key: 'cacheSimTargetRatio', label: isEn ? 'Target hit %' : '目标命中率 %', scale: 100, def: 0.8, step: 1, min: 0, max: 95 },
+                    { key: 'cacheSimCreditCostUsd', label: isEn ? 'Cost/credit $' : '每积分成本 $', scale: 1, def: 0.0015, step: 0.0001, min: 0, max: 1 },
+                    { key: 'cacheSimProfitMargin', label: isEn ? 'Margin %' : '盈利率 %', scale: 100, def: 0.5, step: 5, min: 0, max: 1000 },
+                    { key: 'cacheSimPriceMultiplier', label: isEn ? 'Price ×' : '下游倍率 ×', scale: 1, def: 1, step: 0.1, min: 0, max: 100 }
+                  ] as const).map(f => (
+                    <div key={f.key} className="flex-1 min-w-0">
+                      <Input
+                        type="number"
+                        min={f.min}
+                        max={f.max}
+                        step={f.step}
+                        value={Math.round((config[f.key] ?? f.def) * f.scale * 10000) / 10000}
+                        onChange={(e) => {
+                          const n = parseFloat(e.target.value)
+                          if (!Number.isFinite(n)) return
+                          const v = Math.min(f.max, Math.max(f.min, n)) / f.scale
+                          setConfig(prev => ({ ...prev, [f.key]: v }))
+                          window.api.proxyUpdateConfig({ [f.key]: v })
+                        }}
+                        disabled={!config.cacheSimEnabled}
+                        title={f.label}
+                        placeholder={f.label}
+                        className="h-9"
+                      />
+                      <p className="text-[10px] text-muted-foreground mt-0.5 truncate">{f.label}</p>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>

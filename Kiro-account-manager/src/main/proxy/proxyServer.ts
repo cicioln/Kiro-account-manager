@@ -35,6 +35,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { cacheSimulator, type CacheSimHandle } from './cacheSimulator'
 import { promptLogger, extractLatestUserPrompt } from './promptLogger'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
@@ -272,6 +273,8 @@ interface StreamFailoverContext {
   triedIds: Set<string>
   apiKeyId?: string
   sessionHint?: string
+  /** 缓存模拟器句柄（cacheSimEnabled 时存在），流结束时用真实 usage 拆分缓存 */
+  cacheSim?: CacheSimHandle
 }
 
 export class ProxyServer {
@@ -1841,6 +1844,37 @@ export class ProxyServer {
     }
   }
 
+  /** cacheSimEnabled 时开始一次缓存模拟；关闭或出错返回 undefined（走原有逻辑） */
+  private beginCacheSim(
+    format: 'claude' | 'openai',
+    apiKeyId: string | undefined,
+    model: string,
+    sessionHint: string | undefined,
+    head: unknown[],
+    messages: unknown[]
+  ): CacheSimHandle | undefined {
+    if (!this.config.cacheSimEnabled) return undefined
+    try {
+      return cacheSimulator.begin({
+        format,
+        apiKeyId,
+        model,
+        sessionHint,
+        head,
+        messages,
+        settings: {
+          targetRatio: this.config.cacheSimTargetRatio,
+          creditCostUsd: this.config.cacheSimCreditCostUsd,
+          profitMargin: this.config.cacheSimProfitMargin,
+          priceMultiplier: this.config.cacheSimPriceMultiplier
+        }
+      })
+    } catch (error) {
+      proxyLogger.warn('ProxyServer', 'Cache simulation failed', error)
+      return undefined
+    }
+  }
+
   // 记录 API Key 用量
   recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string): void {
     if (!this.config.apiKeys) return
@@ -2150,7 +2184,7 @@ export class ProxyServer {
       // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
       const { clearAllCaches } = require('./kiroApi')
       const cleared = clearAllCaches()
-      const promptCacheCleared = promptCacheTracker.clear()
+      const promptCacheCleared = promptCacheTracker.clear() + cacheSimulator.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
     } else {
@@ -2240,7 +2274,8 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts',
+      'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -2859,6 +2894,8 @@ export class ProxyServer {
       // 转换为 Kiro 格式
       const thinkingConfig = this.getThinkingConfig(processedRequest.model)
       const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, thinkingConfig)
+      const cacheSim = this.beginCacheSim('openai', matchedApiKey?.id, processedRequest.model, affinityHintChat,
+        [processedRequest.tools], processedRequest.messages)
 
       // 记录请求详情到日志
       if (this.config.logRequests) {
@@ -2886,7 +2923,8 @@ export class ProxyServer {
           attemptsLeft: Math.max(0, (this.config.maxRetries || 3) - 1),
           triedIds: new Set<string>([account.id]),
           apiKeyId: matchedApiKey?.id,
-          sessionHint: affinityHintChat
+          sessionHint: affinityHintChat,
+          cacheSim
         })
       } else {
         // 非流式响应（带重试机制）
@@ -2902,6 +2940,7 @@ export class ProxyServer {
         )
         // 重试中可能切换了账号：会话粘性改绑到实际成功的账号
         this.rememberAffinity(affinityHintChat, usedAccount.id)
+        if (cacheSim) result.usage = cacheSim.finish(result.usage)
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         this.throwIfResponseClosed(res, signal)
@@ -2980,6 +3019,8 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
+      const cacheSim = this.beginCacheSim('openai', matchedApiKey?.id, processedRequest.model, affinityHintResp,
+        [processedRequest.tools], processedRequest.messages)
       if (processedRequest.stream) {
         // 心跳在 callWithRetry 等待完整结果期间保持连接活跃
         this.writeSseHead(res, 'comment')
@@ -2996,6 +3037,7 @@ export class ProxyServer {
           matchedApiKey?.id
         )
         this.rememberAffinity(affinityHintResp, usedAccount.id)
+        if (cacheSim) result.usage = cacheSim.finish(result.usage)
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
         const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
@@ -3050,6 +3092,7 @@ export class ProxyServer {
         matchedApiKey?.id
       )
       this.rememberAffinity(affinityHintResp, usedAccount.id)
+      if (cacheSim) result.usage = cacheSim.finish(result.usage)
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
       const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
@@ -3152,7 +3195,8 @@ export class ProxyServer {
             resolve()
             return
           }
-          
+          if (failover?.cacheSim) usage = failover.cacheSim.finish(usage)
+
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
@@ -3325,9 +3369,12 @@ export class ProxyServer {
         estimatedInputTokens,
         processedRequest.model
       )
-      const cacheUsage = promptCacheTracker.compute(account.id, cacheProfile)
+      // 开启缓存模拟时由 cacheSimulator 接管，旧的按账号模拟不再生效
+      const cacheSim = this.beginCacheSim('claude', matchedApiKey?.id, processedRequest.model, affinityHint,
+        [processedRequest.tools, processedRequest.system], processedRequest.messages)
+      const cacheUsage = promptCacheTracker.compute(account.id, cacheSim ? null : cacheProfile)
 
-      if (cacheProfile) {
+      if (cacheProfile && !cacheSim) {
         proxyLogger.info('ProxyServer', `Prompt cache: ${cacheProfile.breakpoints.length} breakpoints, creation=${cacheUsage.cacheCreationInputTokens}, read=${cacheUsage.cacheReadInputTokens}`)
       }
 
@@ -3353,13 +3400,14 @@ export class ProxyServer {
       if (request.stream) {
         // 流式响应：仅在首包前出现账号侧错误时故障切换（次数受 maxRetries 约束），已输出内容后不重放
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined,
+          cacheProfile && !cacheSim ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined,
           {
             rebuildPayload: (acc) => claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig),
             attemptsLeft: Math.max(0, (this.config.maxRetries || 3) - 1),
             triedIds: new Set<string>([account.id]),
             apiKeyId: matchedApiKey?.id,
-            sessionHint: affinityHint
+            sessionHint: affinityHint,
+            cacheSim
           })
       } else {
         // 非流式响应（带重试机制）
@@ -3375,10 +3423,11 @@ export class ProxyServer {
         )
         // 重试中可能切换了账号：会话粘性改绑到实际成功的账号
         this.rememberAffinity(affinityHint, usedAccount.id)
+        if (cacheSim) result.usage = cacheSim.finish(result.usage)
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         // 用缓存模拟的 usage 覆盖（如果有 cache profile）
-        if (cacheProfile && cacheUsage) {
+        if (cacheProfile && cacheUsage && !cacheSim) {
           if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
           if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
           // 覆盖 cache 字段后同步重算 input_tokens（与流式 buildClaudeUsage 一致：全量 - cache 部分），避免客户端重复计费
@@ -3609,6 +3658,7 @@ export class ProxyServer {
             resolve()
             return
           }
+          if (failover?.cacheSim) usage = failover.cacheSim.finish(usage)
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })

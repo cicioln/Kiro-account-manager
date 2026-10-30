@@ -575,6 +575,18 @@ export interface ProxyConfig {
   /** 记录每个用户本轮输入的提示词到 <userData>/logs/prompts/prompts-YYYY-MM-DD.jsonl */
   logUserPrompts?: boolean
 
+  // ============ 缓存模拟（按会话平滑命中率 + 积分成本兜底） ============
+  /** 开启后返回给客户端的 usage 按目标命中率拆分 cache_read / cache_creation / input */
+  cacheSimEnabled?: boolean
+  /** 会话长期目标命中率（0~0.95），默认 0.8 */
+  cacheSimTargetRatio?: number
+  /** 每积分成本（美元），默认 0.0015 */
+  cacheSimCreditCostUsd?: number
+  /** 盈利率：下游收费 ≥ 积分成本 × (1 + 盈利率)，默认 0.5 */
+  cacheSimProfitMargin?: number
+  /** 下游按 Anthropic 官方价计费时的倍率（new-api 分组倍率），默认 1 */
+  cacheSimPriceMultiplier?: number
+
   // ============ Agent 模式 + Steering（v1.7.5 新增） ============
   /** Agent 模式：vibe（对话优先）或 spec（计划优先）。默认 vibe */
   agentMode?: 'vibe' | 'spec'
