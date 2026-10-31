@@ -81,6 +81,7 @@ interface ProxyConfig {
   cacheSimCreditCostUsd?: number
   cacheSimProfitMargin?: number
   cacheSimPriceMultiplier?: number
+  maxReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
   autoSwitchOnQuotaExhausted?: boolean
@@ -1112,7 +1113,28 @@ export function ProxyPanel() {
                     placeholder={isEn ? 'Select mode' : '选择模式'}
                   />
                 </div>
-                <div className="col-span-2 space-y-1.5">
+                <div className="space-y-1.5">
+                  <Label className="text-xs" title={isEn ? 'Highest reasoning effort actually sent to Kiro. Higher client requests are lowered to the highest level the model supports within this limit; lower requests and "none" are kept.' : 'Kiro 上游实际执行的最高推理等级。客户端请求超过时降到模型支持的、不超过该值的最高等级；低于上限的请求与 none 保持不变。'}>{isEn ? 'Max Reasoning Effort' : '最高推理等级'}</Label>
+                  <Select
+                    value={config.maxReasoningEffort || ''}
+                    options={[
+                      { value: '', label: isEn ? 'Unlimited' : '不限制', description: isEn ? 'Default, keep client effort' : '默认，保持客户端等级' },
+                      { value: 'low', label: 'low' },
+                      { value: 'medium', label: 'medium' },
+                      { value: 'high', label: 'high' },
+                      { value: 'xhigh', label: 'xhigh' },
+                      { value: 'max', label: 'max' }
+                    ]}
+                    onChange={(value) => {
+                      const level = (value || undefined) as ProxyConfig['maxReasoningEffort']
+                      setConfig(prev => ({ ...prev, maxReasoningEffort: level }))
+                      // 用 null 显式清除（undefined 经 IPC 序列化会丢失，导致无法切回不限制）
+                      window.api.proxyUpdateConfig({ maxReasoningEffort: level ?? null })
+                    }}
+                    placeholder={isEn ? 'Unlimited' : '不限制'}
+                  />
+                </div>
+                <div className="space-y-1.5">
                   <Label className="text-xs" title={isEn ? 'Workspace path for loading .kiro/steering/*.md rules into system prompt' : '工作区路径，用于加载 .kiro/steering/*.md 规则注入到 system prompt'}>{isEn ? 'Workspace Path (Steering)' : '工作区路径 (Steering)'}</Label>
                   <Input
                     value={config.workspacePath || ''}

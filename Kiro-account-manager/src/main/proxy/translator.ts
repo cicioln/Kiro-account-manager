@@ -29,78 +29,29 @@ import type {
 } from './types'
 import { buildKiroPayload, mapModelId } from './kiroApi'
 import { ToolNameRegistry } from './toolNameRegistry'
+import { planThinkingFields, type ThinkingConfig, type ThinkingPlan, type MaxReasoningEffort } from './effortLimit'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
-/** 模型 thinking 能力元数据（由 proxyServer 从模型缓存中查询后传入） */
-export interface ThinkingConfig {
-  schemaPath: 'output_config' | 'reasoning'
-  efforts: string[]
-  defaultEffort?: string
+export type { ThinkingConfig } from './effortLimit'
+
+/** 推理等级上下文：模型 schema + 管理员配置的最高等级 + 可选的计划回调（内部日志用） */
+export interface ThinkingOptions {
+  config?: ThinkingConfig
+  maxEffort?: MaxReasoningEffort
+  onPlan?: (plan: ThinkingPlan) => void
 }
 
-/**
- * 将客户端 effort / thinking 参数 + 模型 schema path 映射为 Kiro additionalModelRequestFields。
- * 官方 Kiro IDE 的 kr() 函数逻辑：
- *   output_config → { thinking: { type: 'adaptive', display: 'summarized' }, output_config: { effort } }
- *   reasoning     → { reasoning: { effort } }
- */
 function buildThinkingFields(
-  thinkingConfig: ThinkingConfig | undefined,
+  thinking: ThinkingConfig | ThinkingOptions | undefined,
   clientThinking?: { type: string; budget_tokens?: number; display?: string },
   clientReasoningEffort?: string
 ): Record<string, unknown> | undefined {
-  // 客户端明确关闭 thinking
-  if (clientThinking?.type === 'disabled') return undefined
-
-  // 没有模型元数据时，回退到旧逻辑：仅传 { thinking: { type: 'adaptive' } }
-  if (!thinkingConfig) {
-    if (clientThinking && clientThinking.type !== 'disabled') {
-      return { thinking: { type: 'adaptive' } }
-    }
-    if (clientReasoningEffort) {
-      return { thinking: { type: 'adaptive' } }
-    }
-    return undefined
-  }
-
-  // 客户端没请求 thinking 也没请求 reasoning_effort → 不启用
-  const wantsThinking = !!(clientThinking && clientThinking.type !== 'disabled') || !!clientReasoningEffort
-  if (!wantsThinking) return undefined
-
-  // 映射 effort level（直接使用客户端值，不做强制转换）
-  const mapEffort = (input: string): string => input.toLowerCase()
-
-  let effort: string
-  if (clientReasoningEffort) {
-    effort = mapEffort(clientReasoningEffort)
-  } else if (clientThinking?.type === 'enabled' && clientThinking.budget_tokens) {
-    // budget_tokens 粗略映射到 effort level
-    const b = clientThinking.budget_tokens
-    if (b <= 4000) effort = 'low'
-    else if (b <= 16000) effort = 'medium'
-    else if (b <= 64000) effort = 'high'
-    else effort = 'xhigh'
-  } else {
-    effort = thinkingConfig.defaultEffort || 'high'
-  }
-
-  // 确保 effort 在可用范围内，否则取最接近的
-  if (!thinkingConfig.efforts.includes(effort)) {
-    effort = thinkingConfig.efforts[thinkingConfig.efforts.length - 1] || 'high'
-  }
-
-  switch (thinkingConfig.schemaPath) {
-    case 'output_config':
-      return {
-        thinking: { type: 'adaptive', display: 'summarized' },
-        output_config: { effort }
-      }
-    case 'reasoning':
-      return { reasoning: { effort } }
-    default:
-      return { thinking: { type: 'adaptive' } }
-  }
+  // 兼容旧调用：直接传 ThinkingConfig
+  const opts: ThinkingOptions = thinking && 'schemaPath' in thinking ? { config: thinking } : (thinking || {})
+  const plan = planThinkingFields(opts.config, clientThinking, clientReasoningEffort, opts.maxEffort)
+  opts.onPlan?.(plan)
+  return plan.fields
 }
 
 function toKiroCachePoint(cacheControl?: { type: string }): KiroCachePoint | undefined {
@@ -212,6 +163,12 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
+  // Responses 的 reasoning.effort → Chat 的 reasoning_effort，与 Chat / Messages 共用同一套等级处理与上限
+  const reasoningEffort = (request.reasoning as { effort?: unknown } | null | undefined)?.effort
+  // none 不映射：旧逻辑在不限制模式下会把未知等级兜底成模型最高档，none 必须保持「不开推理」（与此前 Responses 行为一致）
+  if (typeof reasoningEffort === 'string' && reasoningEffort && reasoningEffort.toLowerCase() !== 'none') {
+    chatRequest.reasoning_effort = reasoningEffort
+  }
   return chatRequest
 }
 
@@ -328,7 +285,7 @@ export function openaiToKiro(
   request: OpenAIChatRequest,
   profileArn?: string,
   toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-  thinkingConfig?: ThinkingConfig
+  thinkingConfig?: ThinkingConfig | ThinkingOptions
 ): KiroPayload {
   const modelId = mapModelId(request.model)
   const origin = 'AI_EDITOR'
@@ -943,7 +900,7 @@ export function claudeToKiro(
   request: ClaudeRequest,
   profileArn?: string,
   toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-  thinkingConfig?: ThinkingConfig
+  thinkingConfig?: ThinkingConfig | ThinkingOptions
 ): KiroPayload {
   const modelId = mapModelId(request.model)
   const origin = 'AI_EDITOR'

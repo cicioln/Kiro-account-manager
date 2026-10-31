@@ -587,6 +587,10 @@ export interface ProxyConfig {
   /** 下游按 Anthropic 官方价计费时的倍率（new-api 分组倍率），默认 1 */
   cacheSimPriceMultiplier?: number
 
+  // ============ 最高推理等级 ============
+  /** Kiro 上游实际执行的最高推理等级；未设置 = 不限制（旧行为）。客户端请求超过时按模型支持的等级向下取 */
+  maxReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
   // ============ Agent 模式 + Steering（v1.7.5 新增） ============
   /** Agent 模式：vibe（对话优先）或 spec（计划优先）。默认 vibe */
   agentMode?: 'vibe' | 'spec'

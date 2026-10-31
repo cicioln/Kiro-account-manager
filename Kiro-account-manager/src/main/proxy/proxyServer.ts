@@ -19,7 +19,7 @@ import type {
   KiroPayload
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, mapModelId, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -31,8 +31,10 @@ import {
   createOpenaiStreamChunk,
   createClaudeStreamEvent,
   responsesToOpenAIChat,
-  openAIChatToResponsesResponse
+  openAIChatToResponsesResponse,
+  type ThinkingOptions
 } from './translator'
+import { planThinkingFields, normalizeMaxReasoningEffort, ReasoningEffortLimitError, type ThinkingPlan } from './effortLimit'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { cacheSimulator, type CacheSimHandle } from './cacheSimulator'
@@ -1117,14 +1119,65 @@ export class ProxyServer {
   }
 
   // 从模型缓存查找指定模型的 thinking 配置
-  private getThinkingConfig(modelId: string): ThinkingConfig | undefined {
+  private getThinkingConfig(modelId: string, allowMappedId = false): ThinkingConfig | undefined {
     if (!this.modelCache) return undefined
     const lower = modelId.toLowerCase()
-    const model = this.modelCache.models.find(m => m.modelId.toLowerCase() === lower)
+    let model = this.modelCache.models.find(m => m.modelId.toLowerCase() === lower)
+    if (!model && allowMappedId) {
+      // 别名（如 claude-opus-4-6）按发给 Kiro 的真实 modelId 再查一次
+      const mapped = mapModelId(modelId).toLowerCase()
+      model = this.modelCache.models.find(m => m.modelId.toLowerCase() === mapped)
+    }
     if (!model) return undefined
     const schema = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
     if (!schema?.schemaPath || !schema.efforts?.length) return undefined
     return { schemaPath: schema.schemaPath, efforts: schema.efforts }
+  }
+
+  /**
+   * 推理等级上下文：模型 schema + 最高推理等级。
+   * 未设置上限时与旧逻辑一致（只按精确 modelId 查 schema）。
+   * onPlan 只写内部日志区分 requested / effective，不进入任何下游响应。
+   */
+  private getThinkingOptions(modelId: string, path: string): ThinkingOptions {
+    const maxEffort = normalizeMaxReasoningEffort(this.config.maxReasoningEffort)
+    const config = this.getThinkingConfig(modelId, !!maxEffort)
+    let logged = false
+    return {
+      config,
+      maxEffort,
+      onPlan: (plan: ThinkingPlan) => {
+        if (logged || !maxEffort || !plan.limited) return
+        logged = true
+        proxyLogger.info('ProxyServer', `[${path}] reasoning effort limited: model=${modelId} requested_effort=${plan.requestedEffort ?? '(default)'} effective_effort=${plan.effectiveEffort ?? '(off)'} max_reasoning_effort=${maxEffort}`)
+      }
+    }
+  }
+
+  /** 预校验推理等级是否能在上限内满足（失败抛 ReasoningEffortLimitError，避免进入重试/计入账号错误） */
+  private assertThinkingPlan(opts: ThinkingOptions, thinking: unknown, effort: string | undefined): void {
+    if (!opts.maxEffort) return
+    planThinkingFields(opts.config, thinking as { type: string; budget_tokens?: number } | undefined, effort, opts.maxEffort)
+  }
+
+  /** 设置了最高推理等级但模型缓存为空时，先拉取一次模型列表以获得 effort schema */
+  private async ensureModelSchemaForLimit(account: ProxyAccount, signal?: AbortSignal): Promise<void> {
+    if (!normalizeMaxReasoningEffort(this.config.maxReasoningEffort) || this.modelCache) return
+    try {
+      const kiroModels = await fetchKiroModels(account, signal)
+      if (kiroModels.length > 0) {
+        this.modelCache = { models: kiroModels, timestamp: Date.now() }
+        for (const m of kiroModels) {
+          if (m.tokenLimits?.maxInputTokens) {
+            setModelContextWindow(m.modelId, m.tokenLimits.maxInputTokens)
+          }
+        }
+      }
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      // 拉取失败：无 schema 时 planThinkingFields 会安全地不开启推理
+      proxyLogger.warn('ProxyServer', `Failed to fetch models for reasoning effort limit: ${(error as Error).message}`)
+    }
   }
 
   // 获取可用模型列表
@@ -2275,7 +2328,8 @@ export class ProxyServer {
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts',
-      'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier'
+      'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier',
+      'maxReasoningEffort'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -2562,7 +2616,8 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
-      const geminiThinkingConfig = this.getThinkingConfig(openaiRequest.model)
+      await this.ensureModelSchemaForLimit(account, signal)
+      const geminiThinkingConfig = this.getThinkingOptions(openaiRequest.model, '/v1beta')
       const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, geminiThinkingConfig)
 
       if (isStream) {
@@ -2892,7 +2947,9 @@ export class ProxyServer {
       }
 
       // 转换为 Kiro 格式
-      const thinkingConfig = this.getThinkingConfig(processedRequest.model)
+      await this.ensureModelSchemaForLimit(account, signal)
+      // 原始请求中的 reasoning_effort 不被改写；实际等级只体现在 kiroPayload.additionalModelRequestFields
+      const thinkingConfig = this.getThinkingOptions(processedRequest.model, '/v1/chat/completions')
       const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, thinkingConfig)
       const cacheSim = this.beginCacheSim('openai', matchedApiKey?.id, processedRequest.model, affinityHintChat,
         [processedRequest.tools], processedRequest.messages)
@@ -3019,6 +3076,10 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
+      await this.ensureModelSchemaForLimit(account, signal)
+      const respThinkingOptions = this.getThinkingOptions(processedRequest.model, '/v1/responses')
+      // 在写 SSE 头之前校验，失败时能返回普通 400
+      this.assertThinkingPlan(respThinkingOptions, processedRequest.thinking, processedRequest.reasoning_effort)
       const cacheSim = this.beginCacheSim('openai', matchedApiKey?.id, processedRequest.model, affinityHintResp,
         [processedRequest.tools], processedRequest.messages)
       if (processedRequest.stream) {
@@ -3029,7 +3090,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
+            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, respThinkingOptions)
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
@@ -3084,7 +3145,7 @@ export class ProxyServer {
       const { result, account: usedAccount } = await this.callWithRetry(
         account,
         async (acc) => {
-          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
+          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, respThinkingOptions)
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
@@ -3357,7 +3418,9 @@ export class ProxyServer {
         processedRequest.system = this.injectSteeringClaude(processedRequest.system) as string | undefined
       }
 
-      const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
+      await this.ensureModelSchemaForLimit(account, signal)
+      // 原始请求中的 output_config.effort 不被改写；实际等级只体现在 kiroPayload.additionalModelRequestFields
+      const claudeThinkingConfig = this.getThinkingOptions(processedRequest.model, '/v1/messages')
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, claudeThinkingConfig)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
@@ -3778,6 +3841,20 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
+    // 推理等级超出模型在上限内可用的等级：客户端请求问题，返回 400，不计入账号错误
+    if (error instanceof ReasoningEffortLimitError) {
+      if (res.headersSent) {
+        if (path === '/v1/responses' || path === '/responses') {
+          res.write(`event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', error: { type: 'invalid_request_error', message: error.message } })}\n\n`)
+        }
+        res.end()
+      } else {
+        this.sendError(res, 400, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+      }
+      this.events.onResponse?.({ path, status: 400, error: error.message })
+      this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+      return
+    }
     // 只解析 kiroApi 固定前缀里的状态码；旧的 /(\d{3})/ 会把 IP/端口/响应体数字当状态码
     const errMsg = error.message || ''
     const parsedCode = this.parseUpstreamStatus(errMsg)
