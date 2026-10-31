@@ -157,6 +157,12 @@ export class CacheSimulator {
     const margin = Math.max(0, s.profitMargin ?? CACHE_SIM_DEFAULTS.profitMargin)
     const multiplier = Math.max(0, s.priceMultiplier ?? CACHE_SIM_DEFAULTS.priceMultiplier)
 
+    // 目标 0%：完全不报缓存（与不支持缓存的上游一致），避免出现"只写入不读取"
+    if (target <= 0) {
+      proxyLogger.info('CacheSim', `total=${total} target=0, no cache reported`)
+      return { ...usage, inputTokens: total, cacheReadTokens: 0, cacheWriteTokens: 0 }
+    }
+
     // 会话平滑：本轮命中率 = 让会话累计命中率回到目标值所需的值
     const now = Date.now()
     const stat = this.sessions.get(sessionKey) || { input: 0, read: 0, lastSeen: now }
