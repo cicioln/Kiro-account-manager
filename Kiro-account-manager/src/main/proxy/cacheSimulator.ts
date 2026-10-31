@@ -165,10 +165,13 @@ export class CacheSimulator {
 
     let read = Math.round(total * ratio)
     const remainder = total - read
-    let uncached = Math.min(remainder, Math.max(1, Math.round(total * tailRatio)))
+    const tail = Math.min(remainder, Math.max(1, Math.round(total * tailRatio)))
+    // cache_creation 只算前缀匹配没命中的新内容（不含最新一条消息）；
+    // 已缓存过、但本轮被平滑/兜底压掉的前缀算普通 input，不能重复报写入（写入按 1.25 倍计费，会多收）
     // OpenAI 格式没有 cache_creation 概念
-    const write = opts.format === 'claude' ? remainder - uncached : 0
-    if (opts.format !== 'claude') uncached = remainder
+    const fresh = Math.round(total * (1 - matchRatio)) - tail
+    const write = opts.format === 'claude' ? clamp(fresh, 0, remainder - tail) : 0
+    let uncached = remainder - write
 
     // 成本兜底
     const credits = usage.credits || 0
