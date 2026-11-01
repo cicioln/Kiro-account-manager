@@ -309,7 +309,7 @@ export class ProxyServer {
    * 优先级 2：请求体中的会话相关字段（body）
    * 优先级 3：返回 undefined（由 kiroApi 用 history fingerprint 兜底）
    */
-  static extractSessionHint(req: http.IncomingMessage, body: unknown): string | undefined {
+  static extractSessionHint(req: http.IncomingMessage, body: unknown, parseUserId = false): string | undefined {
     const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
     const h = req.headers
     // 优先级 1：显式稳定 header
@@ -339,6 +339,19 @@ export class ProxyServer {
         (metadata.session_id as string) ||
         (metadata.conversation_id as string)
       if (metaHint) return metaHint
+      // 高并发模式：Claude Code 的 metadata.user_id 带会话 ID（经 new-api 转发时 header 会丢，body 还在）
+      // 旧格式 user_<hash>_account_<uuid>_session_<uuid>；新格式是 JSON 字符串 {"session_id": ...}
+      const userId = metadata.user_id
+      if (parseUserId && typeof userId === 'string') {
+        const m = userId.match(/_session_([0-9a-f-]{8,})/i)
+        if (m) return `session_${m[1]}`
+        if (userId.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(userId) as Record<string, unknown>
+            if (typeof parsed.session_id === 'string' && parsed.session_id) return `session_${parsed.session_id}`
+          } catch { /* 非 JSON，忽略 */ }
+        }
+      }
     }
 
     // 优先级 3：无显式 ID，返回 undefined（kiroApi 用 history fingerprint 兜底）
@@ -1919,7 +1932,8 @@ export class ProxyServer {
           targetRatio: this.config.cacheSimTargetRatio,
           creditCostUsd: this.config.cacheSimCreditCostUsd,
           profitMargin: this.config.cacheSimProfitMargin,
-          priceMultiplier: this.config.cacheSimPriceMultiplier
+          priceMultiplier: this.config.cacheSimPriceMultiplier,
+          highConcurrency: this.config.cacheSimHighConcurrency === true
         }
       })
     } catch (error) {
@@ -2328,7 +2342,7 @@ export class ProxyServer {
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts',
-      'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier',
+      'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier', 'cacheSimHighConcurrency',
       'maxReasoningEffort'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
@@ -2891,7 +2905,7 @@ export class ProxyServer {
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
-    const rawHintChat = ProxyServer.extractSessionHint(req, request)
+    const rawHintChat = ProxyServer.extractSessionHint(req, request, this.config.cacheSimHighConcurrency === true)
     if (!request.conversation_id && rawHintChat) {
       const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
       request.conversation_id = `${keyPrefix}:${rawHintChat}`
@@ -3039,7 +3053,7 @@ export class ProxyServer {
       responseRequest = JSON.parse(body)
       chatRequest = responsesToOpenAIChat(responseRequest)
       // session hint：用于会话粘性
-      const rawHintResp = ProxyServer.extractSessionHint(req, responseRequest)
+      const rawHintResp = ProxyServer.extractSessionHint(req, responseRequest, this.config.cacheSimHighConcurrency === true)
       if (rawHintResp) {
         const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
         affinityHintResp = `${keyPrefix}:${rawHintResp}`
@@ -3362,7 +3376,7 @@ export class ProxyServer {
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
-    const rawHint = ProxyServer.extractSessionHint(req, request)
+    const rawHint = ProxyServer.extractSessionHint(req, request, this.config.cacheSimHighConcurrency === true)
     if (!request.conversation_id && rawHint) {
       const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
       request.conversation_id = `${keyPrefix}:${rawHint}`

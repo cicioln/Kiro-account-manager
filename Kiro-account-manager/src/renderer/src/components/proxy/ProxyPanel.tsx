@@ -81,6 +81,7 @@ interface ProxyConfig {
   cacheSimCreditCostUsd?: number
   cacheSimProfitMargin?: number
   cacheSimPriceMultiplier?: number
+  cacheSimHighConcurrency?: boolean
   maxReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
@@ -1162,6 +1163,21 @@ export function ProxyPanel() {
                         setConfig(prev => ({ ...prev, cacheSimEnabled: checked }))
                         window.api.proxyUpdateConfig({ cacheSimEnabled: checked })
                       }}
+                      className="scale-90"
+                    />
+                  </div>
+                  <div
+                    className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[160px] flex-shrink-0"
+                    title={isEn ? 'For many concurrent clients: larger LRU prefix table that only stores head + last breakpoints, and reads the Claude Code session ID from metadata.user_id. Keeps hit rates stable instead of dropping to the cold cap when prefixes get evicted.' : '客户端多时开启：前缀表扩容为 LRU 且只记录首尾断点，并从 metadata.user_id 解析 Claude Code 会话 ID。避免前缀被其他会话挤掉后命中率掉到冷启动上限。'}
+                  >
+                    <span className="text-xs text-muted-foreground">{isEn ? 'High concurrency' : '高并发模式'}</span>
+                    <Switch
+                      checked={config.cacheSimHighConcurrency || false}
+                      onCheckedChange={(checked) => {
+                        setConfig(prev => ({ ...prev, cacheSimHighConcurrency: checked }))
+                        window.api.proxyUpdateConfig({ cacheSimHighConcurrency: checked })
+                      }}
+                      disabled={!config.cacheSimEnabled}
                       className="scale-90"
                     />
                   </div>

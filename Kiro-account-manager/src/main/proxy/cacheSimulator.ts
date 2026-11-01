@@ -16,6 +16,10 @@ const SESSION_TTL = 60 * 60 * 1000        // 会话累计统计保留 1 小时
 const PRUNE_INTERVAL = 60 * 1000
 const MAX_PREFIXES_PER_SCOPE = 500
 const MAX_SESSIONS = 5000
+// 高并发模式：大量客户端共用一个 scope 时，500 条会被别的会话挤掉导致前缀失配
+const HC_MAX_PREFIXES_PER_SCOPE = 20000
+const HC_MAX_SESSIONS = 50000
+const HC_TAIL_POINTS = 4                  // 只写 head（tools/system）+ 最后几个断点；下一轮追加消息后仍能匹配上一轮末尾
 const MAX_RATIO = 0.95                    // 有前缀命中时单轮命中率上限
 const COLD_MAX_RATIO = 0.6                // 无前缀命中（首轮/前缀变化）时单轮上限，后续轮次再补回
 
@@ -31,6 +35,8 @@ export interface CacheSimSettings {
   creditCostUsd?: number
   profitMargin?: number
   priceMultiplier?: number
+  /** 高并发模式：大容量 LRU 前缀表 + 只写首尾断点 */
+  highConcurrency?: boolean
 }
 
 interface ModelPrice {
@@ -95,9 +101,12 @@ export class CacheSimulator {
   private prefixes = new Map<string, Map<string, number>>()   // scope → hash → expiresAt
   private sessions = new Map<string, SessionStat>()
   private lastPrune = Date.now()
+  private maxSessions = MAX_SESSIONS
 
   begin(opts: CacheSimBeginOptions): CacheSimHandle {
     const now = Date.now()
+    const hc = opts.settings.highConcurrency === true
+    this.maxSessions = hc ? HC_MAX_SESSIONS : MAX_SESSIONS
     this.pruneIfNeeded(now)
 
     const scope = `${opts.apiKeyId || 'anon'}:${opts.model}`
@@ -134,8 +143,22 @@ export class CacheSimulator {
       }
     }
     // 立即写入（含最后一段），并发的同前缀请求也能命中
-    for (const p of points) entries.set(p.hash, now + PREFIX_TTL)
-    if (entries.size > MAX_PREFIXES_PER_SCOPE) {
+    if (hc) {
+      // head 段保留，新会话共用 tools/system 也能命中；先删后写让 Map 插入顺序即 LRU 顺序
+      const headCount = points.length - opts.messages.length
+      for (let i = 0; i < points.length; i++) {
+        if (i >= headCount && i < points.length - HC_TAIL_POINTS) continue
+        entries.delete(points[i].hash)
+        entries.set(points[i].hash, now + PREFIX_TTL)
+      }
+      for (const k of entries.keys()) {
+        if (entries.size <= HC_MAX_PREFIXES_PER_SCOPE) break
+        entries.delete(k)
+      }
+    } else {
+      for (const p of points) entries.set(p.hash, now + PREFIX_TTL)
+    }
+    if (!hc && entries.size > MAX_PREFIXES_PER_SCOPE) {
       const sorted = [...entries.entries()].sort((a, b) => a[1] - b[1])
       for (const [k] of sorted.slice(0, entries.size - MAX_PREFIXES_PER_SCOPE)) entries.delete(k)
     }
@@ -229,9 +252,9 @@ export class CacheSimulator {
       if (entries.size === 0) this.prefixes.delete(scope)
     }
     for (const [key, stat] of this.sessions) if (now - stat.lastSeen > SESSION_TTL) this.sessions.delete(key)
-    if (this.sessions.size > MAX_SESSIONS) {
+    if (this.sessions.size > this.maxSessions) {
       const sorted = [...this.sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen)
-      for (const [key] of sorted.slice(0, this.sessions.size - MAX_SESSIONS)) this.sessions.delete(key)
+      for (const [key] of sorted.slice(0, this.sessions.size - this.maxSessions)) this.sessions.delete(key)
     }
   }
 }
