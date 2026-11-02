@@ -850,7 +850,7 @@ export function kiroToOpenaiResponse(
           }
         })) : undefined
       },
-      finish_reason: restoredToolUses.length > 0 ? 'tool_calls' : 'stop'
+      finish_reason: restoredToolUses.length > 0 ? 'tool_calls' : usage.truncated ? 'length' : 'stop'
     }],
     usage: openaiUsage
   }
@@ -874,7 +874,7 @@ export function createOpenaiStreamChunk(
   id: string,
   model: string,
   delta: { role?: 'assistant'; content?: string; reasoning_content?: string; tool_calls?: { index: number; id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }[] },
-  finishReason: 'stop' | 'tool_calls' | null = null,
+  finishReason: 'stop' | 'length' | 'tool_calls' | null = null,
   usage?: OpenAIUsage
 ): OpenAIStreamChunk & { usage?: OpenAIUsage } {
   const chunk: OpenAIStreamChunk & { usage?: OpenAIUsage } = {
@@ -1369,7 +1369,7 @@ export function kiroToClaudeResponse(
     role: 'assistant',
     content: contentBlocks,
     model,
-    stop_reason: restoredToolUses.length > 0 ? 'tool_use' : 'end_turn',
+    stop_reason: restoredToolUses.length > 0 ? 'tool_use' : usage.truncated ? 'max_tokens' : 'end_turn',
     stop_sequence: null,
     usage: claudeUsage
   }

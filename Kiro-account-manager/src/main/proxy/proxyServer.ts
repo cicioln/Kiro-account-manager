@@ -3293,7 +3293,8 @@ export class ProxyServer {
 
           // 发送结束 chunk（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
-          const finishReason = hasToolCalls ? 'tool_calls' : 'stop'
+          // 被 Kiro 截断时报 length，客户端可据此续写而不是当作正常结束
+          const finishReason = hasToolCalls ? 'tool_calls' : usage.truncated ? 'length' : 'stop'
           const usageInfo: {
             prompt_tokens: number
             completion_tokens: number
@@ -3776,7 +3777,8 @@ export class ProxyServer {
           }
           // 发送 message_delta（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
-          const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
+          // 被 Kiro 截断时报 max_tokens：Claude Code 会自动续写，而不是当作回答结束
+          const stopReason = hasToolCalls ? 'tool_use' : usage.truncated ? 'max_tokens' : 'end_turn'
           const messageDelta = createClaudeStreamEvent('message_delta', {
             delta: { stop_reason: stopReason, stop_sequence: null } as any,
             usage: this.buildClaudeUsage(usage, simulatedCacheUsage)

@@ -375,6 +375,8 @@ export interface KiroUsage {
   cacheReadTokens?: number
   cacheWriteTokens?: number
   reasoningTokens?: number
+  /** 输出被 Kiro 截断（ContentLengthExceededException / 工具输入不完整），应向客户端报 max_tokens */
+  truncated?: boolean
   /** Context usage breakdown（来自后端 ContextUsageEvent） */
   contextUsage?: {
     percentage: number

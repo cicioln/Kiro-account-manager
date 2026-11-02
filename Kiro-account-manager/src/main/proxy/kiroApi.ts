@@ -1524,6 +1524,8 @@ async function parseEventStream(
   let collectedOutputText = ''
   // 是否已拿到 Kiro 真实 tokenUsage（最高优先级，锁定后不再被 contextUsage/tiktoken 覆盖）
   let hasRealTokenUsage = false
+  // 收到 ContentLengthExceededException 后停止读取，按正常结束处理
+  let outputLimitReached = false
   
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
@@ -1770,6 +1772,14 @@ async function parseEventStream(
           } catch { /* 非 JSON payload，使用原文 */ }
           const exType = frameHeaders[':exception-type'] || frameHeaders[':error-code'] || (exEvent.__type as string | undefined) || 'StreamError'
           const exMsg = (exEvent.message as string | undefined) || (exEvent.Message as string | undefined) || frameHeaders[':error-message'] || exText.slice(0, 300) || 'Unknown stream error'
+          // 输出达到上限：不是错误，正常收尾并报 max_tokens，客户端（Claude Code 等）会自动续写；
+          // 旧实现抛错 → 客户端收到 error 直接停止，且账号被误记一次失败
+          if (/ContentLengthExceeded/i.test(exType)) {
+            proxyLogger.warn('Kiro', `Output truncated by Kiro: ${exType}: ${exMsg}`)
+            usage.truncated = true
+            outputLimitReached = true
+            break
+          }
           throw new Error(`${exType}: ${exMsg}`)
         }
 
@@ -1854,6 +1864,7 @@ async function parseEventStream(
                         try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
                       }
                     } else {
+                      usage.truncated = true
                       await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
                     }
                     totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
@@ -1918,6 +1929,7 @@ async function parseEventStream(
                     try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
                   }
                 } else {
+                  usage.truncated = true
                   await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API (output token limit) and was not executed.`)
                 }
                 totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
@@ -2169,6 +2181,12 @@ async function parseEventStream(
             // 检查错误
             if (event.__type || event._type || event.error) {
               const errMsg = event.message || event.error?.message || 'Unknown stream error'
+              if (/ContentLengthExceeded/i.test(String(event.__type || event._type || ''))) {
+                proxyLogger.warn('Kiro', `Output truncated by Kiro: ${errMsg}`)
+                usage.truncated = true
+                outputLimitReached = true
+                break
+              }
               throw new Error(errMsg)
             }
           } catch (parseError) {
@@ -2183,6 +2201,10 @@ async function parseEventStream(
         
         // 移动到下一条消息
         buffer = buffer.slice(totalLength)
+      }
+      if (outputLimitReached) {
+        reader.cancel().catch(() => undefined)
+        break
       }
     }
 
@@ -2204,6 +2226,7 @@ async function parseEventStream(
           try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
         }
       } else {
+        usage.truncated = true
         await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
       }
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
