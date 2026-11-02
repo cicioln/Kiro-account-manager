@@ -1492,6 +1492,15 @@ export function estimateTokens(text: string): number {
   return countTokens(text)
 }
 
+/** 上游连接中途断开（Kiro 侧 socket 关闭 / 重置），不是请求本身的问题，可换账号重试 */
+export function isUpstreamDropError(error: unknown): boolean {
+  const e = error as (Error & { cause?: { code?: string; message?: string } }) | undefined
+  if (!e) return false
+  if (e.message === 'terminated') return true
+  const text = `${e.message || ''} ${e.cause?.code || ''} ${e.cause?.message || ''}`
+  return /other side closed|socket hang up|ECONNRESET|EPIPE|UND_ERR_(SOCKET|BODY_TIMEOUT|CLOSED)/i.test(text)
+}
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
@@ -1714,9 +1723,22 @@ async function parseEventStream(
     signal?.addEventListener('abort', abort, { once: true })
     while (true) {
       throwIfAborted(signal)
-      const { done, value } = await reader.read()
+      let chunk: Awaited<ReturnType<typeof reader.read>>
+      try {
+        chunk = await reader.read()
+      } catch (readError) {
+        // 上游中途断开（undici "terminated" / ECONNRESET）：已输出过内容时无法重放，
+        // 按截断收尾（报 max_tokens），Claude Code 会自动续写；未输出内容时抛出，由调用方换账号重试
+        if (!signal?.aborted && totalOutputChars > 0 && isUpstreamDropError(readError)) {
+          proxyLogger.warn('Kiro', `Upstream stream dropped after ${totalOutputChars} chars, ending as truncated: ${(readError as Error).message}`)
+          usage.truncated = true
+          break
+        }
+        throw readError
+      }
+      const { done, value } = chunk
       throwIfAborted(signal)
-      
+
       if (done) {
         break
       }

@@ -19,7 +19,7 @@ import type {
   KiroPayload
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, mapModelId, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, mapModelId, isUpstreamDropError, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -1674,8 +1674,8 @@ export class ProxyServer {
           continue
         }
 
-        // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
-        if (status !== undefined && status >= 500) {
+        // 5xx / 上游连接中途断开: 同账号短退避重试一次；再次失败直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
+        if ((status !== undefined && status >= 500) || isUpstreamDropError(lastError)) {
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
@@ -2411,6 +2411,8 @@ export class ProxyServer {
   private isStreamFailoverEligible(error: Error): boolean {
     const errMsg = error.message || ''
     if (this.detectSuspendedError(errMsg)) return true
+    // 上游连接中途断开且尚未输出内容：换账号重放
+    if (isUpstreamDropError(error)) return true
     const status = this.parseUpstreamStatus(errMsg)
     if (status === 401 || status === 402 || status === 403 || status === 429) return true
     return /ServiceQuotaExceededException|ThrottlingException/.test(errMsg)
