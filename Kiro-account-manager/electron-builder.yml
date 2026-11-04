@@ -84,5 +84,6 @@ snap:
 npmRebuild: false
 publish:
   provider: github
-  owner: chaogei
+  owner: cicioln
   repo: Kiro-account-manager
+  releaseType: release

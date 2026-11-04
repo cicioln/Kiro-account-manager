@@ -4,7 +4,7 @@ name: Build Linux x64
 on:
   workflow_dispatch:
   push:
-    branches: [main, 'fix/**']
+    branches: ['fix/**']
     paths:
       - 'Kiro-account-manager/**'
       - '.github/workflows/build-linux-x64.yml'
