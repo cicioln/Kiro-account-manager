@@ -1890,6 +1890,7 @@ async function parseEventStream(
                       await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
                     }
                     totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
+                    collectedOutputText += currentToolUse.name + currentToolUse.inputBuffer
                     processedIds.add(currentToolUse.toolUseId)
                   }
                   currentToolUse = null
@@ -1955,7 +1956,8 @@ async function parseEventStream(
                   await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API (output token limit) and was not executed.`)
                 }
                 totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
-                
+                collectedOutputText += currentToolUse.name + currentToolUse.inputBuffer
+
                 processedIds.add(currentToolUse.toolUseId)
                 currentToolUse = null
               }
@@ -2109,6 +2111,8 @@ async function parseEventStream(
                 if (logStreamEvents) proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
                 await onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
+                // 思考 token 属于输出（Anthropic output_tokens 含 thinking），估算时必须计入
+                collectedOutputText += reasoning.text
                 usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
               } else if (reasoning.signature && !reasoning.redactedContent) {
                 await onChunk('', undefined, true, reasoning.signature, undefined)
@@ -2252,6 +2256,7 @@ async function parseEventStream(
         await onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API and was not executed.`)
       }
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
+      collectedOutputText += currentToolUse.name + currentToolUse.inputBuffer
     }
 
     // 工具调用 XML 泄漏修复：流结束统一去重后注入救回的工具
