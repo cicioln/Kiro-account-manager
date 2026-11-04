@@ -14,6 +14,15 @@ import { ApiKeyUsageDialog } from './ApiKeyUsageDialog'
 
 type ApiKeyFormat = 'sk' | 'simple' | 'token'
 
+// 按 Key 覆盖缓存模拟；字段未设置 = 跟随全局
+interface CacheSimOverride {
+  enabled?: boolean
+  targetRatio?: number
+  creditCostUsd?: number
+  profitMargin?: number
+  priceMultiplier?: number
+}
+
 interface UsageRecord {
   timestamp: number
   model: string
@@ -32,6 +41,7 @@ interface ApiKey {
   createdAt: number
   lastUsedAt?: number
   creditsLimit?: number
+  cacheSim?: CacheSimOverride
   usage: {
     totalRequests: number
     totalCredits: number
@@ -126,6 +136,22 @@ export function ApiKeyManager() {
       }
     } catch (error) {
       console.error('Failed to toggle API key:', error)
+    }
+  }
+
+  const updateCacheSim = async (apiKey: ApiKey, patch: Partial<CacheSimOverride>) => {
+    const merged: CacheSimOverride = { ...apiKey.cacheSim, ...patch }
+    // 去掉 undefined 字段，保证"跟随全局"在存储里真的是缺省
+    const cleaned = Object.fromEntries(
+      Object.entries(merged).filter(([, v]) => v !== undefined)
+    ) as CacheSimOverride
+    try {
+      const result = await window.api.proxyUpdateApiKey(apiKey.id, { cacheSim: cleaned })
+      if (result.success) {
+        setApiKeys(prev => prev.map(k => k.id === apiKey.id ? { ...k, cacheSim: cleaned } : k))
+      }
+    } catch (error) {
+      console.error('Failed to update cache sim override:', error)
     }
   }
 
@@ -377,6 +403,53 @@ export function ApiKeyManager() {
                   className="w-32 h-8"
                 />
                 <span className="text-xs text-muted-foreground">{isEn ? '(0 = unlimited)' : '(0 = 无限制)'}</span>
+              </div>
+              <div className="space-y-2 rounded-lg border p-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">{isEn ? 'Cache simulation:' : '缓存模拟:'}</span>
+                  <Select
+                    value={selectedKeyData.cacheSim?.enabled === true ? 'on' : selectedKeyData.cacheSim?.enabled === false ? 'off' : 'global'}
+                    options={[
+                      { value: 'global', label: isEn ? 'Follow global' : '跟随全局' },
+                      { value: 'on', label: isEn ? 'On' : '开启' },
+                      { value: 'off', label: isEn ? 'Off' : '关闭' }
+                    ]}
+                    onChange={v => updateCacheSim(selectedKeyData, { enabled: v === 'on' ? true : v === 'off' ? false : undefined })}
+                    className="w-[120px]"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    { field: 'targetRatio', label: isEn ? 'Target %' : '目标缓存 %', scale: 100 },
+                    { field: 'creditCostUsd', label: isEn ? 'Cost / credit' : '每积分成本', scale: 1 },
+                    { field: 'profitMargin', label: isEn ? 'Margin %' : '盈利率 %', scale: 100 },
+                    { field: 'priceMultiplier', label: isEn ? 'Downstream multiplier' : '下游倍率', scale: 1 }
+                  ] as const).map(({ field, label, scale }) => {
+                    const current = selectedKeyData.cacheSim?.[field]
+                    return (
+                      <div key={field} className="flex items-center gap-2">
+                        <span className="text-xs text-muted-foreground w-24 shrink-0">{label}</span>
+                        <Input
+                          key={`${selectedKeyData.id}-${field}-${current ?? ''}`}
+                          type="number"
+                          step="any"
+                          placeholder={isEn ? 'Global' : '跟随全局'}
+                          defaultValue={current === undefined ? '' : String(+(current * scale).toFixed(6))}
+                          onBlur={e => {
+                            const raw = e.target.value.trim()
+                            const num = raw === '' ? undefined : parseFloat(raw)
+                            const next = num === undefined || !Number.isFinite(num) || num < 0 ? undefined : num / scale
+                            if (next !== current) updateCacheSim(selectedKeyData, { [field]: next })
+                          }}
+                          className="h-8"
+                        />
+                      </div>
+                    )
+                  })}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {isEn ? 'Empty fields use the global cache simulation settings.' : '留空的项使用全局缓存模拟设置。'}
+                </div>
               </div>
               <div className="text-xs text-muted-foreground space-y-1">
                 <div className="flex items-center gap-2">

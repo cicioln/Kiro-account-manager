@@ -1919,7 +1919,12 @@ export class ProxyServer {
     head: unknown[],
     messages: unknown[]
   ): CacheSimHandle | undefined {
-    if (!this.config.cacheSimEnabled) return undefined
+    // 按 Key 覆盖：未设置的字段跟随全局
+    const override = apiKeyId ? this.config.apiKeys?.find(k => k.id === apiKeyId)?.cacheSim : undefined
+    const enabled = typeof override?.enabled === 'boolean' ? override.enabled : this.config.cacheSimEnabled
+    if (!enabled) return undefined
+    const pick = (v: unknown, fallback: number | undefined): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : fallback
     try {
       return cacheSimulator.begin({
         format,
@@ -1929,10 +1934,10 @@ export class ProxyServer {
         head,
         messages,
         settings: {
-          targetRatio: this.config.cacheSimTargetRatio,
-          creditCostUsd: this.config.cacheSimCreditCostUsd,
-          profitMargin: this.config.cacheSimProfitMargin,
-          priceMultiplier: this.config.cacheSimPriceMultiplier,
+          targetRatio: pick(override?.targetRatio, this.config.cacheSimTargetRatio),
+          creditCostUsd: pick(override?.creditCostUsd, this.config.cacheSimCreditCostUsd),
+          profitMargin: pick(override?.profitMargin, this.config.cacheSimProfitMargin),
+          priceMultiplier: pick(override?.priceMultiplier, this.config.cacheSimPriceMultiplier),
           highConcurrency: this.config.cacheSimHighConcurrency === true
         }
       })

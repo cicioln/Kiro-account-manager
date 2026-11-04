@@ -438,6 +438,15 @@ export interface ApiKeyUsageRecord {
   path: string
 }
 
+// 单个 API Key 的缓存模拟覆盖；任一字段为 undefined 时使用全局 ProxyConfig.cacheSim* 值
+export interface ApiKeyCacheSimOverride {
+  enabled?: boolean        // undefined = 跟随全局开关
+  targetRatio?: number     // 0-1
+  creditCostUsd?: number
+  profitMargin?: number    // 0.5 = 50%
+  priceMultiplier?: number
+}
+
 // API Key 类型
 export interface ApiKey {
   id: string
@@ -449,6 +458,8 @@ export interface ApiKey {
   lastUsedAt?: number
   // 额度限制
   creditsLimit?: number  // Credits 上限（undefined 表示无限制）
+  // 按 Key 覆盖缓存模拟设置（字段未设置 = 跟随全局）
+  cacheSim?: ApiKeyCacheSimOverride
   // 用量统计
   usage: {
     totalRequests: number
