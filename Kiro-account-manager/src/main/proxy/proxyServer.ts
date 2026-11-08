@@ -3300,8 +3300,8 @@ export class ProxyServer {
 
           // 发送结束 chunk（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
-          // 被 Kiro 截断时报 length，客户端可据此续写而不是当作正常结束
-          const finishReason = hasToolCalls ? 'tool_calls' : usage.truncated ? 'length' : 'stop'
+          // Kiro 拒绝继续时报 content_filter；被 Kiro 截断时报 length，客户端可据此续写而不是当作正常结束
+          const finishReason = usage.refusal ? 'content_filter' : hasToolCalls ? 'tool_calls' : usage.truncated ? 'length' : 'stop'
           const usageInfo: {
             prompt_tokens: number
             completion_tokens: number
@@ -3512,7 +3512,8 @@ export class ProxyServer {
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         // 用缓存模拟的 usage 覆盖（如果有 cache profile）
-        if (cacheProfile && cacheUsage && !cacheSim) {
+        // Kiro 拒绝且未计费时 usage 已清零，不再叠加缓存模拟
+        if (cacheProfile && cacheUsage && !cacheSim && !(result.usage.refusal && !result.usage.credits)) {
           if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
           if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
           // 覆盖 cache 字段后同步重算 input_tokens（与流式 buildClaudeUsage 一致：全量 - cache 部分），避免客户端重复计费
@@ -3744,6 +3745,8 @@ export class ProxyServer {
             return
           }
           if (failover?.cacheSim) usage = failover.cacheSim.finish(usage)
+          // Kiro 拒绝且未计费时 usage 已清零：不再叠加按账号的缓存模拟，否则下游仍会按缓存 token 计费
+          const billedCacheUsage = usage.refusal && !usage.credits ? undefined : simulatedCacheUsage
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
@@ -3767,11 +3770,11 @@ export class ProxyServer {
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
+          this.stats.cacheReadTokens += usage.cacheReadTokens || billedCacheUsage?.cacheReadInputTokens || 0
+          this.stats.cacheWriteTokens += usage.cacheWriteTokens || billedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
+          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || billedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
@@ -3779,16 +3782,17 @@ export class ProxyServer {
           }
 
           // 成功后更新 prompt cache tracker
-          if (simulatedCacheUsage?.cacheProfile && simulatedCacheUsage?.accountId) {
-            promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as any)
+          if (billedCacheUsage?.cacheProfile && billedCacheUsage?.accountId) {
+            promptCacheTracker.update(billedCacheUsage.accountId, billedCacheUsage.cacheProfile as any)
           }
           // 发送 message_delta（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
+          // Kiro 拒绝继续时报 refusal：Claude Code 会提示被拒，而不是当作正常结束静默停止；
           // 被 Kiro 截断时报 max_tokens：Claude Code 会自动续写，而不是当作回答结束
-          const stopReason = hasToolCalls ? 'tool_use' : usage.truncated ? 'max_tokens' : 'end_turn'
+          const stopReason = usage.refusal ? 'refusal' : hasToolCalls ? 'tool_use' : usage.truncated ? 'max_tokens' : 'end_turn'
           const messageDelta = createClaudeStreamEvent('message_delta', {
             delta: { stop_reason: stopReason, stop_sequence: null } as any,
-            usage: this.buildClaudeUsage(usage, simulatedCacheUsage)
+            usage: this.buildClaudeUsage(usage, billedCacheUsage)
           })
           res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
           // 发送 message_stop

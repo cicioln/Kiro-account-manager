@@ -85,7 +85,7 @@ export interface OpenAIChoice {
     reasoning_content?: string
     tool_calls?: OpenAIToolCall[]
   }
-  finish_reason: 'stop' | 'length' | 'tool_calls' | null
+  finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null
 }
 
 export interface OpenAIStreamChunk {
@@ -101,7 +101,7 @@ export interface OpenAIStreamChunk {
       reasoning_content?: string
       tool_calls?: Partial<OpenAIToolCall>[]
     }
-    finish_reason: 'stop' | 'length' | 'tool_calls' | null
+    finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null
   }[]
 }
 
@@ -235,7 +235,7 @@ export interface ClaudeResponse {
   role: 'assistant'
   content: ClaudeContentBlock[]
   model: string
-  stop_reason: 'end_turn' | 'max_tokens' | 'tool_use' | null
+  stop_reason: 'end_turn' | 'max_tokens' | 'tool_use' | 'refusal' | null
   stop_sequence: string | null
   usage: {
     input_tokens: number
@@ -377,6 +377,8 @@ export interface KiroUsage {
   reasoningTokens?: number
   /** 输出被 Kiro 截断（ContentLengthExceededException / 工具输入不完整），应向客户端报 max_tokens */
   truncated?: boolean
+  /** Kiro 拒绝继续（messageMetadataEvent stopReason=CONTENT_FILTERED），应向客户端报 refusal */
+  refusal?: { category?: string; explanation?: string }
   /** Context usage breakdown（来自后端 ContextUsageEvent） */
   contextUsage?: {
     percentage: number

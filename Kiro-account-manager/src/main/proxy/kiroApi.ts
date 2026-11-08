@@ -1967,7 +1967,18 @@ async function parseEventStream(
             if (eventType === 'messageMetadataEvent' || eventType === 'metadataEvent' || event.messageMetadataEvent || event.metadataEvent) {
               const metadata = event.messageMetadataEvent || event.metadataEvent || event
               proxyLogger.info('Kiro', 'messageMetadataEvent', metadata)
-              
+
+              // Kiro 拒绝继续：stopReason=CONTENT_FILTERED，stopDetails.refusal 带 category/explanation。
+              // 旧实现只记日志、按 end_turn 返回，客户端只看到 thinking 然后静默停止
+              if (typeof metadata.stopReason === 'string' && metadata.stopReason.toUpperCase() === 'CONTENT_FILTERED') {
+                const refusal = metadata.stopDetails?.refusal || {}
+                usage.refusal = {
+                  category: typeof refusal.category === 'string' ? refusal.category : undefined,
+                  explanation: typeof refusal.explanation === 'string' ? refusal.explanation : undefined
+                }
+                proxyLogger.warn('Kiro', `Kiro refused to continue: ${usage.refusal.category || 'unknown category'}`)
+              }
+
               // 检查 tokenUsage 对象
               if (metadata.tokenUsage) {
                 const tokenUsage = metadata.tokenUsage
@@ -2282,6 +2293,14 @@ async function parseEventStream(
       }
     }
 
+    // Kiro 拒绝继续：把说明作为文本输出，客户端能看到原因（stop_reason 由调用方报 refusal）。
+    // 不计入 collectedOutputText：这段文字不是模型输出
+    if (usage.refusal) {
+      const category = usage.refusal.category ? ` (${usage.refusal.category})` : ''
+      const explanation = usage.refusal.explanation || 'The model refused to continue this conversation.'
+      await onChunk(`${totalOutputChars > 0 ? '\n\n' : ''}⚠️ Kiro refused to continue${category}: ${explanation}`)
+    }
+
     // 如果 API 没有返回 token 信息，优先用 tiktoken 精确计算，兜底字符系数
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
       if (collectedOutputText) {
@@ -2304,6 +2323,15 @@ async function parseEventStream(
     // 既无真实 tokenUsage 也无 contextUsage 反推时，才用 tiktoken 精确计算输入（见初始化处说明）
     if (!hasRealTokenUsage && !usage.contextUsage && payloadStr) {
       usage.inputTokens = countTokens(payloadStr)
+    }
+
+    // 被拒且 Kiro 未计费（credits=0）：不上报估算的 token，避免下游（new-api 等）为没扣费的请求计费
+    if (usage.refusal && !usage.credits) {
+      usage.inputTokens = 0
+      usage.outputTokens = 0
+      usage.reasoningTokens = 0
+      usage.cacheReadTokens = 0
+      usage.cacheWriteTokens = 0
     }
 
     throwIfAborted(signal)
