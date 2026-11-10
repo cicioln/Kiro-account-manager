@@ -225,12 +225,13 @@ export class CacheSimulator {
     let write = opts.format === 'claude' ? clamp(fresh, 0, remainder - tail) : 0
     let uncached = remainder - write
 
-    // 随机写入区间：cache_creation 在区间内随机跳动；先占用普通 input，不够再从 cache_read 挪，
+    // 随机写入区间：cache_creation 在区间内随机跳动；先从 cache_read 挪，不够再占用普通 input，
     // 请求总量小于随机值时封顶为总量。写入单价高于 input / cache_read，只会提高下游收费，不影响成本兜底
     const range = opts.format === 'claude' ? resolveWriteRange(s) : undefined
     if (range) {
       write = Math.min(total, range.min + Math.floor(Math.random() * (range.max - range.min + 1)))
-      read = Math.min(read, total - write)
+      const fromRead = Math.min(read, write)
+      read -= fromRead
       uncached = total - write - read
     }
 
