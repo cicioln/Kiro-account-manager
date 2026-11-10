@@ -23,6 +23,7 @@ interface CacheSimOverride {
   priceMultiplier?: number
   writeMin?: number
   writeMax?: number
+  jitter?: number
 }
 
 interface UsageRecord {
@@ -423,6 +424,7 @@ export function ApiKeyManager() {
                 <div className="grid grid-cols-2 gap-2">
                   {([
                     { field: 'targetRatio', label: isEn ? 'Target %' : '目标缓存 %', scale: 100 },
+                    { field: 'jitter', label: isEn ? 'Jitter ±%' : '波动 ±%', scale: 100 },
                     { field: 'creditCostUsd', label: isEn ? 'Cost / credit' : '每积分成本', scale: 1 },
                     { field: 'profitMargin', label: isEn ? 'Margin %' : '盈利率 %', scale: 100 },
                     { field: 'priceMultiplier', label: isEn ? 'Downstream multiplier' : '下游倍率', scale: 1 },

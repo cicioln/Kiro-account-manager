@@ -84,6 +84,7 @@ interface ProxyConfig {
   cacheSimHighConcurrency?: boolean
   cacheSimWriteMin?: number
   cacheSimWriteMax?: number
+  cacheSimJitter?: number
   maxReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
@@ -1185,6 +1186,7 @@ export function ProxyPanel() {
                   </div>
                   {([
                     { key: 'cacheSimTargetRatio', label: isEn ? 'Target hit %' : '目标命中率 %', scale: 100, def: 0.8, step: 1, min: 0, max: 95 },
+                    { key: 'cacheSimJitter', label: isEn ? 'Hit jitter ±%' : '命中率波动 ±%', scale: 100, def: 0, step: 1, min: 0, max: 50 },
                     { key: 'cacheSimCreditCostUsd', label: isEn ? 'Cost/credit $' : '每积分成本 $', scale: 1, def: 0.0015, step: 0.0001, min: 0, max: 1 },
                     { key: 'cacheSimProfitMargin', label: isEn ? 'Margin %' : '盈利率 %', scale: 100, def: 0.5, step: 5, min: 0, max: 1000 },
                     { key: 'cacheSimPriceMultiplier', label: isEn ? 'Price ×' : '下游倍率 ×', scale: 1, def: 1, step: 0.1, min: 0, max: 100 }

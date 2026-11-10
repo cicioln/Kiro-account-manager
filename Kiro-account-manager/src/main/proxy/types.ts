@@ -449,6 +449,7 @@ export interface ApiKeyCacheSimOverride {
   priceMultiplier?: number
   writeMin?: number        // 随机缓存写入下限（token）
   writeMax?: number        // 随机缓存写入上限（token），> 0 才生效
+  jitter?: number          // 命中率波动幅度 0-0.5（0.1 = ±10%）
 }
 
 // API Key 类型
@@ -609,6 +610,8 @@ export interface ProxyConfig {
   cacheSimWriteMin?: number
   /** 随机缓存写入上限（token）；> 0 时 Claude 请求的 cache_creation 在 [下限, 上限] 内随机，0 / 未设置 = 按前缀匹配计算 */
   cacheSimWriteMax?: number
+  /** 命中率波动幅度（0~0.5，0.1 = ±10%）：每轮命中率在目标附近随机跳动，会话长期平均仍趋近目标；默认 0 */
+  cacheSimJitter?: number
 
   // ============ 最高推理等级 ============
   /** Kiro 上游实际执行的最高推理等级；未设置 = 不限制（旧行为）。客户端请求超过时按模型支持的等级向下取 */

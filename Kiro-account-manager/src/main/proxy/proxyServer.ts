@@ -1940,7 +1940,8 @@ export class ProxyServer {
           priceMultiplier: pick(override?.priceMultiplier, this.config.cacheSimPriceMultiplier),
           highConcurrency: this.config.cacheSimHighConcurrency === true,
           writeMin: pick(override?.writeMin, this.config.cacheSimWriteMin),
-          writeMax: pick(override?.writeMax, this.config.cacheSimWriteMax)
+          writeMax: pick(override?.writeMax, this.config.cacheSimWriteMax),
+          jitter: pick(override?.jitter, this.config.cacheSimJitter)
         }
       })
     } catch (error) {
@@ -2350,7 +2351,7 @@ export class ProxyServer {
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'logUserPrompts',
       'cacheSimEnabled', 'cacheSimTargetRatio', 'cacheSimCreditCostUsd', 'cacheSimProfitMargin', 'cacheSimPriceMultiplier', 'cacheSimHighConcurrency',
-      'cacheSimWriteMin', 'cacheSimWriteMax',
+      'cacheSimWriteMin', 'cacheSimWriteMax', 'cacheSimJitter',
       'maxReasoningEffort'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改

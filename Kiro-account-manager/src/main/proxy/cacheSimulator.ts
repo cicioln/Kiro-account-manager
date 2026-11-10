@@ -40,6 +40,8 @@ export interface CacheSimSettings {
   /** 随机缓存写入区间（token）：writeMax > 0 时每次 Claude 请求的 cache_creation 在 [writeMin, writeMax] 内随机 */
   writeMin?: number
   writeMax?: number
+  /** 命中率波动幅度（0~0.5）：每轮命中率在 会话平滑值 ± jitter 内随机，会话平滑在后续轮次把偏差补回 */
+  jitter?: number
 }
 
 /** 解析随机写入区间；未设置或上限 ≤ 0 返回 undefined（走前缀匹配算出的写入量） */
@@ -208,7 +210,10 @@ export class CacheSimulator {
     const now = Date.now()
     const stat = this.sessions.get(sessionKey) || { input: 0, read: 0, lastSeen: now }
     const desired = (target * (stat.input + total) - stat.read) / total
-    const ratio = clamp(desired, 0, matchRatio > 0 ? MAX_RATIO : Math.min(COLD_MAX_RATIO, target))
+    // 命中率波动：在平滑值上叠加 ±jitter 的随机偏移；偏差计入会话累计，下一轮平滑会反向补回
+    const jitter = clamp(s.jitter ?? 0, 0, 0.5)
+    const jittered = jitter > 0 ? desired + (Math.random() * 2 - 1) * jitter : desired
+    const ratio = clamp(jittered, 0, matchRatio > 0 ? MAX_RATIO : Math.min(COLD_MAX_RATIO, target))
 
     let read = Math.round(total * ratio)
     const remainder = total - read
