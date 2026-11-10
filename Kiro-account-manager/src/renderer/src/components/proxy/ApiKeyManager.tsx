@@ -21,6 +21,8 @@ interface CacheSimOverride {
   creditCostUsd?: number
   profitMargin?: number
   priceMultiplier?: number
+  writeMin?: number
+  writeMax?: number
 }
 
 interface UsageRecord {
@@ -423,7 +425,9 @@ export function ApiKeyManager() {
                     { field: 'targetRatio', label: isEn ? 'Target %' : '目标缓存 %', scale: 100 },
                     { field: 'creditCostUsd', label: isEn ? 'Cost / credit' : '每积分成本', scale: 1 },
                     { field: 'profitMargin', label: isEn ? 'Margin %' : '盈利率 %', scale: 100 },
-                    { field: 'priceMultiplier', label: isEn ? 'Downstream multiplier' : '下游倍率', scale: 1 }
+                    { field: 'priceMultiplier', label: isEn ? 'Downstream multiplier' : '下游倍率', scale: 1 },
+                    { field: 'writeMin', label: isEn ? 'Write min' : '写入下限', scale: 1 },
+                    { field: 'writeMax', label: isEn ? 'Write max' : '写入上限', scale: 1 }
                   ] as const).map(({ field, label, scale }) => {
                     const current = selectedKeyData.cacheSim?.[field]
                     return (

@@ -82,6 +82,8 @@ interface ProxyConfig {
   cacheSimProfitMargin?: number
   cacheSimPriceMultiplier?: number
   cacheSimHighConcurrency?: boolean
+  cacheSimWriteMin?: number
+  cacheSimWriteMax?: number
   maxReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
@@ -1200,6 +1202,39 @@ export function ProxyPanel() {
                           const v = Math.min(f.max, Math.max(f.min, n)) / f.scale
                           setConfig(prev => ({ ...prev, [f.key]: v }))
                           window.api.proxyUpdateConfig({ [f.key]: v })
+                        }}
+                        disabled={!config.cacheSimEnabled}
+                        title={f.label}
+                        placeholder={f.label}
+                        className="h-9"
+                      />
+                      <p className="text-[10px] text-muted-foreground mt-0.5 truncate">{f.label}</p>
+                    </div>
+                  ))}
+                </div>
+                {/* 随机缓存写入区间：上限 > 0 时 cache_creation 在区间内随机 */}
+                <div
+                  className="flex items-center gap-2"
+                  title={isEn ? 'Random cache write (Claude format): when max > 0, cache_creation_input_tokens is a random number in [min, max] on every request, capped at the request\'s input total. Leave max empty or 0 to use the prefix-match calculation.' : '随机缓存写入（Claude 格式）：上限 > 0 时，每次请求的 cache_creation_input_tokens 在 [下限, 上限] 内随机，不超过本次请求的输入总量。上限留空或为 0 时按前缀匹配计算。'}
+                >
+                  <span className="text-xs text-muted-foreground w-[160px] flex-shrink-0">{isEn ? 'Random cache write' : '随机缓存写入'}</span>
+                  {([
+                    { key: 'cacheSimWriteMin', label: isEn ? 'Write min (tokens)' : '写入下限 (token)' },
+                    { key: 'cacheSimWriteMax', label: isEn ? 'Write max (tokens, 0 = off)' : '写入上限 (token，0 = 关闭)' }
+                  ] as const).map(f => (
+                    <div key={f.key} className="flex-1 min-w-0">
+                      <Input
+                        type="number"
+                        min={0}
+                        step={100}
+                        value={config[f.key] ?? ''}
+                        onChange={(e) => {
+                          const raw = e.target.value.trim()
+                          const n = raw === '' ? undefined : parseInt(raw, 10)
+                          if (n !== undefined && !Number.isFinite(n)) return
+                          const v = n === undefined ? undefined : Math.max(0, n)
+                          setConfig(prev => ({ ...prev, [f.key]: v }))
+                          window.api.proxyUpdateConfig({ [f.key]: v ?? 0 })
                         }}
                         disabled={!config.cacheSimEnabled}
                         title={f.label}

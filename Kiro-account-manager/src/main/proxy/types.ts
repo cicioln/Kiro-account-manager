@@ -447,6 +447,8 @@ export interface ApiKeyCacheSimOverride {
   creditCostUsd?: number
   profitMargin?: number    // 0.5 = 50%
   priceMultiplier?: number
+  writeMin?: number        // 随机缓存写入下限（token）
+  writeMax?: number        // 随机缓存写入上限（token），> 0 才生效
 }
 
 // API Key 类型
@@ -603,6 +605,10 @@ export interface ProxyConfig {
   cacheSimPriceMultiplier?: number
   /** 高并发模式：前缀表扩容为 LRU 且只写首尾断点，并从 metadata.user_id 解析 Claude Code 会话 ID；默认关闭 */
   cacheSimHighConcurrency?: boolean
+  /** 随机缓存写入下限（token） */
+  cacheSimWriteMin?: number
+  /** 随机缓存写入上限（token）；> 0 时 Claude 请求的 cache_creation 在 [下限, 上限] 内随机，0 / 未设置 = 按前缀匹配计算 */
+  cacheSimWriteMax?: number
 
   // ============ 最高推理等级 ============
   /** Kiro 上游实际执行的最高推理等级；未设置 = 不限制（旧行为）。客户端请求超过时按模型支持的等级向下取 */

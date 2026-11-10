@@ -37,6 +37,17 @@ export interface CacheSimSettings {
   priceMultiplier?: number
   /** 高并发模式：大容量 LRU 前缀表 + 只写首尾断点 */
   highConcurrency?: boolean
+  /** 随机缓存写入区间（token）：writeMax > 0 时每次 Claude 请求的 cache_creation 在 [writeMin, writeMax] 内随机 */
+  writeMin?: number
+  writeMax?: number
+}
+
+/** 解析随机写入区间；未设置或上限 ≤ 0 返回 undefined（走前缀匹配算出的写入量） */
+export function resolveWriteRange(s: CacheSimSettings): { min: number; max: number } | undefined {
+  const a = Number.isFinite(s.writeMin) ? Math.max(0, Math.round(s.writeMin as number)) : 0
+  const b = Number.isFinite(s.writeMax) ? Math.max(0, Math.round(s.writeMax as number)) : 0
+  if (b <= 0) return undefined
+  return { min: Math.min(a, b), max: b }
 }
 
 interface ModelPrice {
@@ -181,7 +192,14 @@ export class CacheSimulator {
     const multiplier = Math.max(0, s.priceMultiplier ?? CACHE_SIM_DEFAULTS.priceMultiplier)
 
     // 目标 0%：完全不报缓存（与不支持缓存的上游一致），避免出现"只写入不读取"
+    // 但配置了随机写入区间时仍按区间报写入（用户显式要求）
     if (target <= 0) {
+      const range = opts.format === 'claude' ? resolveWriteRange(s) : undefined
+      if (range) {
+        const write = Math.min(total, range.min + Math.floor(Math.random() * (range.max - range.min + 1)))
+        proxyLogger.info('CacheSim', `total=${total} target=0 random write=${write} input=${total - write}`)
+        return { ...usage, inputTokens: total, cacheReadTokens: 0, cacheWriteTokens: write }
+      }
       proxyLogger.info('CacheSim', `total=${total} target=0, no cache reported`)
       return { ...usage, inputTokens: total, cacheReadTokens: 0, cacheWriteTokens: 0 }
     }
@@ -199,8 +217,17 @@ export class CacheSimulator {
     // 已缓存过、但本轮被平滑/兜底压掉的前缀算普通 input，不能重复报写入（写入按 1.25 倍计费，会多收）
     // OpenAI 格式没有 cache_creation 概念
     const fresh = Math.round(total * (1 - matchRatio)) - tail
-    const write = opts.format === 'claude' ? clamp(fresh, 0, remainder - tail) : 0
+    let write = opts.format === 'claude' ? clamp(fresh, 0, remainder - tail) : 0
     let uncached = remainder - write
+
+    // 随机写入区间：cache_creation 在区间内随机跳动；先占用普通 input，不够再从 cache_read 挪，
+    // 请求总量小于随机值时封顶为总量。写入单价高于 input / cache_read，只会提高下游收费，不影响成本兜底
+    const range = opts.format === 'claude' ? resolveWriteRange(s) : undefined
+    if (range) {
+      write = Math.min(total, range.min + Math.floor(Math.random() * (range.max - range.min + 1)))
+      read = Math.min(read, total - write)
+      uncached = total - write - read
+    }
 
     // 成本兜底
     const credits = usage.credits || 0
