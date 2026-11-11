@@ -3,7 +3,7 @@
 //    每个消息结尾都是断点（不依赖 cache_control，三个接口通用）
 // 2. 会话平滑：按会话累计 input / cache_read，让长期命中率趋近目标值
 // 3. 成本兜底：本轮 credits × 每积分成本 × (1 + 盈利率) 必须 ≤ 下游按官方价 × 倍率算出的收费，
-//    不够时先把 cache_read 挪回普通 input（会拉低该轮命中率），仍不够再把普通 input 改报为 cache_creation（仅 Claude 格式）
+//    不够时把 cache_read 挪回普通 input（会拉低该轮命中率）
 // 最终数字都按 Kiro 返回的 inputTokens 拆分，input + cache_creation + cache_read = 真实总量
 
 import { createHash } from 'crypto'
@@ -253,17 +253,8 @@ export class CacheSimulator {
         read -= moved
         uncached += moved
         revenue = calc(read, uncached)
-        // cache_read 挪完仍低于成本线：Claude 格式再把普通 input 改报为 cache_creation（单价 1.25 倍）补差，
-        // 总量不变；OpenAI 格式没有 cache_creation，无法补
-        if (revenue < required && opts.format === 'claude' && uncached > 0) {
-          const writePerToken = multiplier * (p.cacheWrite - p.input) / 1e6
-          const toWrite = Math.min(uncached, Math.ceil((required - revenue) / writePerToken))
-          write += toWrite
-          uncached -= toWrite
-          revenue = calc(read, uncached)
-        }
         if (revenue < required) {
-          proxyLogger.warn('CacheSim', `still below floor after cache_read=0 and input→cache_creation: revenue $${revenue.toFixed(5)} < required $${required.toFixed(5)} (credits=${credits}, model=${opts.model})`)
+          proxyLogger.warn('CacheSim', `cache_read=0 still below floor: revenue $${revenue.toFixed(5)} < required $${required.toFixed(5)} (credits=${credits}, model=${opts.model})`)
         }
       }
     }
